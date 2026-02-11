@@ -142,6 +142,14 @@ export function useImportExport(
 
   const exportConfig = useCallback(async () => {
     try {
+      const confirmed = window.confirm(
+        t("settings.exportSensitiveConfirm", {
+          defaultValue:
+            "The SQL export may include API keys, tokens, and other sensitive configuration data. Continue?",
+        }),
+      );
+      if (!confirmed) return;
+
       const now = new Date();
       const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}_${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
       const defaultName = `cc-switch-export-${stamp}.sql`;

@@ -250,6 +250,7 @@
     "importExport": "SQL Import/Export",
     "importExportHint": "Import or export database SQL backups for migration or restore (import supports only backups exported by CC Switch).",
     "exportConfig": "Export SQL Backup",
+    "exportSensitiveConfirm": "The SQL export may include API keys, tokens, and other sensitive configuration data. Continue?",
     "selectConfigFile": "Select SQL File",
     "noFileSelected": "No configuration file selected.",
     "import": "Import",

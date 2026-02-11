@@ -53,15 +53,12 @@ export function DeepLinkImportDialog() {
     const unlistenImport = listen<DeepLinkImportRequest>(
       "deeplink-import",
       async (event) => {
-        console.log("Deep link import event received:", event.payload);
-
         // If config is present, merge it to get the complete configuration
         if (event.payload.config || event.payload.configUrl) {
           try {
             const mergedRequest = await deeplinkApi.mergeDeeplinkConfig(
               event.payload,
             );
-            console.log("Config merged successfully:", mergedRequest);
             setRequest(mergedRequest);
           } catch (error) {
             console.error("Failed to merge config:", error);
@@ -82,7 +79,7 @@ export function DeepLinkImportDialog() {
 
     // Listen for deep link error events
     const unlistenError = listen<DeeplinkError>("deeplink-error", (event) => {
-      console.error("Deep link error:", event.payload);
+      console.error("Deep link parse error");
       toast.error(t("deeplink.parseError"), {
         description: event.payload.error,
       });

@@ -8,8 +8,8 @@ fn main() {
     // `tauri::test` calls fail with STATUS_ENTRYPOINT_NOT_FOUND.
     //
     // This workaround:
-    // 1. Embeds the manifest into test binaries via /MANIFEST:EMBED
-    // 2. Uses /MANIFEST:NO for the main binary to avoid duplicate resources
+    // 1. Embeds the manifest into test binaries only
+    // 2. Uses /MANIFEST:NO for app binaries to avoid duplicate resources
     //    (Tauri already handles manifest embedding for the app binary)
     #[cfg(target_os = "windows")]
     {
@@ -19,8 +19,9 @@ fn main() {
         .join("common-controls.manifest");
         let manifest_arg = format!("/MANIFESTINPUT:{}", manifest_path.display());
 
-        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg={}", manifest_arg);
+        // Only tests need explicit Common Controls manifest.
+        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-tests={}", manifest_arg);
         // Avoid duplicate manifest resources in binary builds.
         println!("cargo:rustc-link-arg-bins=/MANIFEST:NO");
         println!("cargo:rerun-if-changed={}", manifest_path.display());

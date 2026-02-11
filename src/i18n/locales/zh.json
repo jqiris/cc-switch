@@ -250,6 +250,7 @@
     "importExport": "SQL 导入导出",
     "importExportHint": "导入/导出数据库 SQL 备份（仅支持导入由 CC Switch 导出的备份），便于备份或迁移。",
     "exportConfig": "导出 SQL 备份",
+    "exportSensitiveConfirm": "SQL 导出可能包含 API Key、Token 等敏感配置数据，是否继续？",
     "selectConfigFile": "选择 SQL 文件",
     "noFileSelected": "尚未选择配置文件。",
     "import": "导入",
