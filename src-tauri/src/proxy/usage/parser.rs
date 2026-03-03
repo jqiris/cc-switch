@@ -74,45 +74,39 @@ impl TokenUsage {
                             }
                         }
                         if let Some(msg_usage) = event.get("message").and_then(|m| m.get("usage")) {
-                            // 检查 usage 是否为 null（某些模型可能返回 null）
-                            if !msg_usage.is_null() {
-                                // 从 message_start 获取 input_tokens（原生 Claude API）
-                                if let Some(input) =
-                                    msg_usage.get("input_tokens").and_then(|v| v.as_u64())
-                                {
-                                    usage.input_tokens = input as u32;
-                                }
-                                usage.cache_read_tokens = msg_usage
-                                    .get("cache_read_input_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0)
-                                    as u32;
-                                usage.cache_creation_tokens = msg_usage
-                                    .get("cache_creation_input_tokens")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0)
-                                    as u32;
+                            // 从 message_start 获取 input_tokens（原生 Claude API）
+                            if let Some(input) =
+                                msg_usage.get("input_tokens").and_then(|v| v.as_u64())
+                            {
+                                usage.input_tokens = input as u32;
                             }
+                            usage.cache_read_tokens = msg_usage
+                                .get("cache_read_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                as u32;
+                            usage.cache_creation_tokens = msg_usage
+                                .get("cache_creation_input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                as u32;
                         }
                     }
                     "message_delta" => {
                         if let Some(delta_usage) = event.get("usage") {
-                            // 检查 usage 是否为 null（某些模型可能返回 null）
-                            if !delta_usage.is_null() {
-                                // 从 message_delta 获取 output_tokens
-                                if let Some(output) =
-                                    delta_usage.get("output_tokens").and_then(|v| v.as_u64())
+                            // 从 message_delta 获取 output_tokens
+                            if let Some(output) =
+                                delta_usage.get("output_tokens").and_then(|v| v.as_u64())
+                            {
+                                usage.output_tokens = output as u32;
+                            }
+                            // OpenRouter 转换后的流式响应：input_tokens 也在 message_delta 中
+                            // 如果 message_start 中没有 input_tokens，则从 message_delta 获取
+                            if usage.input_tokens == 0 {
+                                if let Some(input) =
+                                    delta_usage.get("input_tokens").and_then(|v| v.as_u64())
                                 {
-                                    usage.output_tokens = output as u32;
-                                }
-                                // OpenRouter 转换后的流式响应：input_tokens 也在 message_delta 中
-                                // 如果 message_start 中没有 input_tokens，则从 message_delta 获取
-                                if usage.input_tokens == 0 {
-                                    if let Some(input) =
-                                        delta_usage.get("input_tokens").and_then(|v| v.as_u64())
-                                    {
-                                        usage.input_tokens = input as u32;
-                                    }
+                                    usage.input_tokens = input as u32;
                                 }
                             }
                         }
