@@ -272,11 +272,22 @@ pub fn create_anthropic_sse_stream(
                                             }
 
                                             let stop_reason = map_stop_reason(Some(finish_reason));
-                                            // 构建 usage 信息，包含 input_tokens 和 output_tokens
-                                            let usage_json = chunk.usage.as_ref().map(|u| json!({
-                                                "input_tokens": u.prompt_tokens,
-                                                "output_tokens": u.completion_tokens
-                                            }));
+                                            // 始终输出 usage 对象，避免客户端在 usage=null 时读取字段崩溃
+                                            let usage_json = chunk
+                                                .usage
+                                                .as_ref()
+                                                .map(|u| {
+                                                    json!({
+                                                        "input_tokens": u.prompt_tokens,
+                                                        "output_tokens": u.completion_tokens
+                                                    })
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    json!({
+                                                        "input_tokens": 0,
+                                                        "output_tokens": 0
+                                                    })
+                                                });
                                             let event = json!({
                                                 "type": "message_delta",
                                                 "delta": {
