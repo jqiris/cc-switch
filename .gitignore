@@ -25,3 +25,4 @@ flatpak-build/
 flatpak-repo/
 .omc/
 logs/
+.worktrees/
