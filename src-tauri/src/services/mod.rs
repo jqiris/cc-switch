@@ -6,6 +6,7 @@ pub mod omo;
 pub mod prompt;
 pub mod provider;
 pub mod proxy;
+pub mod session_cache;
 pub mod skill;
 pub mod speedtest;
 pub mod stream_check;
@@ -20,6 +21,7 @@ pub use omo::OmoService;
 pub use prompt::PromptService;
 pub use provider::{ProviderService, ProviderSortUpdate, SwitchResult};
 pub use proxy::ProxyService;
+pub use session_cache::SessionCache;
 #[allow(unused_imports)]
 pub use skill::{DiscoverableSkill, Skill, SkillRepo, SkillService};
 pub use speedtest::{EndpointLatency, SpeedtestService};

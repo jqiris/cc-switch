@@ -262,6 +262,31 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        // 18. Project Provider Mappings 表 (项目目录映射)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS project_provider_mappings (
+                id TEXT PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                display_name TEXT,
+                app_type TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 100,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 项目映射索引
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_project_mappings_app_type
+             ON project_provider_mappings(app_type, enabled, priority)",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
         // 尝试添加 live_takeover_active 列到 proxy_config 表
         let _ = conn.execute(
             "ALTER TABLE proxy_config ADD COLUMN live_takeover_active INTEGER NOT NULL DEFAULT 0",
@@ -385,6 +410,11 @@ impl Database {
                         log::info!("迁移数据库从 v5 到 v6（使用量聚合表）");
                         Self::migrate_v5_to_v6(conn)?;
                         Self::set_user_version(conn, 6)?;
+                    }
+                    6 => {
+                        log::info!("迁移数据库从 v6 到 v7（项目目录映射表）");
+                        Self::migrate_v6_to_v7(conn)?;
+                        Self::set_user_version(conn, 7)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -963,6 +993,36 @@ impl Database {
         .map_err(|e| AppError::Database(format!("创建 usage_daily_rollups 表失败: {e}")))?;
 
         log::info!("v5 -> v6 迁移完成：已添加使用量日聚合表");
+        Ok(())
+    }
+
+    /// v6 -> v7 迁移：添加项目目录映射表
+    fn migrate_v6_to_v7(conn: &Connection) -> Result<(), AppError> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS project_provider_mappings (
+                id TEXT PRIMARY KEY,
+                project_path TEXT NOT NULL,
+                display_name TEXT,
+                app_type TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 100,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 project_provider_mappings 表失败: {e}")))?;
+
+        // 创建索引以加速查询
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_project_mappings_app_type
+             ON project_provider_mappings(app_type, enabled, priority)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 project_provider_mappings 索引失败: {e}")))?;
+
+        log::info!("v6 -> v7 迁移完成：已添加项目目录映射表");
         Ok(())
     }
 

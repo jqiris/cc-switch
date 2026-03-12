@@ -11,6 +11,7 @@ use crate::proxy::{
     types::{AppProxyConfig, OptimizerConfig, RectifierConfig},
     ProxyError,
 };
+use crate::services::SessionCache;
 use axum::http::HeaderMap;
 use std::time::Instant;
 
@@ -61,6 +62,10 @@ pub struct RequestContext {
     pub rectifier_config: RectifierConfig,
     /// 优化器配置
     pub optimizer_config: OptimizerConfig,
+    /// 当前 Provider 是否是通过项目目录映射匹配到的
+    ///
+    /// 如果为 true，请求成功后不应该触发全局供应商切换
+    pub is_project_mapped_provider: bool,
 }
 
 impl RequestContext {
@@ -111,7 +116,7 @@ impl RequestContext {
         let session_result = extract_session_id(headers, body, app_type_str);
         let session_id = session_result.session_id.clone();
 
-        log::debug!(
+        log::info!(
             "[{}] Session ID: {} (from {:?}, client_provided: {})",
             tag,
             session_id,
@@ -133,18 +138,25 @@ impl RequestContext {
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
 
-        let provider = providers
-            .first()
-            .cloned()
+        // 尝试根据 session_id 匹配项目目录映射
+        let (provider, providers, is_project_mapped_provider) = Self::try_match_project_provider(
+            &state,
+            &session_id,
+            app_type_str,
+            providers,
+        ).await;
+
+        let provider = provider
             .ok_or(ProxyError::NoAvailableProvider)?;
 
         log::debug!(
-            "[{}] Provider: {}, model: {}, failover chain: {} providers, session: {}",
+            "[{}] Provider: {}, model: {}, failover chain: {} providers, session: {}, project_mapped: {}",
             tag,
             provider.name,
             request_model,
             providers.len(),
-            session_id
+            session_id,
+            is_project_mapped_provider
         );
 
         Ok(Self {
@@ -160,6 +172,7 @@ impl RequestContext {
             session_id,
             rectifier_config,
             optimizer_config,
+            is_project_mapped_provider,
         })
     }
 
@@ -221,6 +234,7 @@ impl RequestContext {
             idle_timeout,
             self.rectifier_config.clone(),
             self.optimizer_config.clone(),
+            self.is_project_mapped_provider,
         )
     }
 
@@ -257,5 +271,76 @@ impl RequestContext {
                 idle_timeout: 0,
             }
         }
+    }
+
+    /// 尝试根据 session_id 匹配项目目录映射
+    ///
+    /// 如果匹配成功，返回匹配的 Provider、重新排序的 Provider 列表和 true；
+    /// 否则返回原始 Provider 列表的第一个和 false。
+    async fn try_match_project_provider(
+        state: &ProxyState,
+        session_id: &str,
+        app_type_str: &str,
+        mut providers: Vec<Provider>,
+    ) -> (Option<Provider>, Vec<Provider>, bool) {
+        // 1. 从 SessionCache 获取 cwd
+        let session_cache = SessionCache::instance();
+        let cwd = session_cache.get_cwd(session_id).await;
+
+        let Some(cwd) = cwd else {
+            return (providers.first().cloned(), providers, false);
+        };
+
+        // 2. 匹配项目目录映射
+        let mapping = state.db.match_project_mapping(&cwd, app_type_str).ok().flatten();
+
+        let Some(mapping) = mapping else {
+            return (providers.first().cloned(), providers, false);
+        };
+
+        // 3. 先在已有列表中查找（避免额外数据库查询）
+        let matched_provider = providers.iter().position(|p| p.id == mapping.provider_id);
+
+        if let Some(idx) = matched_provider {
+            // 将匹配的 Provider 移到列表首位
+            let provider = providers.remove(idx);
+            providers.insert(0, provider.clone());
+            log::info!(
+                "[{}] 项目映射命中: {} -> {}",
+                app_type_str,
+                cwd,
+                provider.name
+            );
+            return (Some(provider), providers, true);
+        }
+
+        // 4. 不在列表中，从数据库获取所有 Provider 查找
+        let all_providers = state.db.get_all_providers(app_type_str);
+        if let Ok(all_providers) = all_providers {
+            if let Some(provider) = all_providers.get(&mapping.provider_id).cloned() {
+                log::info!(
+                    "[{}] 项目映射命中: {} -> {}",
+                    app_type_str,
+                    cwd,
+                    provider.name
+                );
+                // 将匹配的 Provider 插入到列表首位
+                providers.insert(0, provider.clone());
+                return (Some(provider), providers, true);
+            } else {
+                log::warn!(
+                    "[{}] 项目映射的 Provider {} 不存在",
+                    app_type_str,
+                    mapping.provider_id
+                );
+            }
+        }
+
+        log::warn!(
+            "[{}] 项目映射的 Provider {} 不存在",
+            app_type_str,
+            mapping.provider_id
+        );
+        (providers.first().cloned(), providers, false)
     }
 }

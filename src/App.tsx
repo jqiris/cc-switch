@@ -21,6 +21,8 @@ import {
   KeyRound,
   Shield,
   Cpu,
+  FolderTree,
+  AlertTriangle,
 } from "lucide-react";
 import type { Provider, VisibleApps } from "@/types";
 import type { EnvConflict } from "@/types/env";
@@ -71,6 +73,8 @@ import EnvPanel from "@/components/openclaw/EnvPanel";
 import ToolsPanel from "@/components/openclaw/ToolsPanel";
 import AgentsDefaultsPanel from "@/components/openclaw/AgentsDefaultsPanel";
 import OpenClawHealthBanner from "@/components/openclaw/OpenClawHealthBanner";
+import { ProjectMappingPanel } from "@/components/settings/ProjectMappingPanel";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 type View =
   | "providers"
@@ -757,59 +761,144 @@ function App() {
           return (
             <div className="px-6 flex flex-col h-[calc(100vh-8rem)] overflow-hidden">
               <div className="flex-1 overflow-y-auto overflow-x-hidden pb-12 px-1">
-                <AnimatePresence mode="wait">
-                  <motion.div
-                    key={activeApp}
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    transition={{ duration: 0.15 }}
-                    className="space-y-4"
-                  >
-                    <ProviderList
-                      providers={providers}
-                      currentProviderId={currentProviderId}
-                      appId={activeApp}
-                      isLoading={isLoading}
-                      isProxyRunning={isProxyRunning}
-                      isProxyTakeover={
-                        isProxyRunning && isCurrentAppTakeoverActive
-                      }
-                      activeProviderId={activeProviderId}
-                      onSwitch={switchProvider}
-                      onEdit={(provider) => {
-                        setEditingProvider(provider);
-                      }}
-                      onDelete={(provider) =>
-                        setConfirmAction({ provider, action: "delete" })
-                      }
-                      onRemoveFromConfig={
-                        activeApp === "opencode" || activeApp === "openclaw"
-                          ? (provider) =>
-                              setConfirmAction({ provider, action: "remove" })
-                          : undefined
-                      }
-                      onDisableOmo={
-                        activeApp === "opencode" ? handleDisableOmo : undefined
-                      }
-                      onDisableOmoSlim={
-                        activeApp === "opencode"
-                          ? handleDisableOmoSlim
-                          : undefined
-                      }
-                      onDuplicate={handleDuplicateProvider}
-                      onConfigureUsage={setUsageProvider}
-                      onOpenWebsite={handleOpenWebsite}
-                      onOpenTerminal={
-                        activeApp === "claude" ? handleOpenTerminal : undefined
-                      }
-                      onCreate={() => setIsAddOpen(true)}
-                      onSetAsDefault={
-                        activeApp === "openclaw" ? setAsDefaultModel : undefined
-                      }
-                    />
-                  </motion.div>
-                </AnimatePresence>
+                <Tabs defaultValue="providers" className="w-full">
+                  <div className="relative mb-6">
+                    <div className="absolute inset-0 bg-gradient-to-r from-blue-500/10 via-purple-500/5 to-blue-500/10 rounded-xl blur-sm" />
+                    <TabsList className="relative grid w-full grid-cols-2 glass rounded-xl p-1.5 border border-border/50 bg-muted/80">
+                      <TabsTrigger
+                        value="providers"
+                        className="gap-2 data-[state=active]:bg-blue-500 data-[state=active]:text-white data-[state=active]:shadow-md data-[state=inactive]:text-foreground/70 data-[state=inactive]:hover:text-foreground data-[state=inactive]:hover:bg-muted/50 rounded-lg transition-all duration-200 py-2.5"
+                      >
+                        <Cpu className="h-4 w-4" />
+                        <span className="font-semibold">{t("providers.modelConfig", { defaultValue: "模型配置" })}</span>
+                      </TabsTrigger>
+                      <TabsTrigger
+                        value="projectMapping"
+                        className="gap-2 data-[state=active]:bg-purple-500 data-[state=active]:text-white data-[state=active]:shadow-md data-[state=inactive]:text-foreground/70 data-[state=inactive]:hover:text-foreground data-[state=inactive]:hover:bg-muted/50 rounded-lg transition-all duration-200 py-2.5"
+                      >
+                        <FolderTree className="h-4 w-4" />
+                        <span className="font-semibold">{t("providers.projectMapping", { defaultValue: "项目映射" })}</span>
+                      </TabsTrigger>
+                    </TabsList>
+                  </div>
+
+                  <TabsContent value="providers" className="mt-0">
+                    <AnimatePresence mode="wait">
+                      <motion.div
+                        key={activeApp}
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        transition={{ duration: 0.15 }}
+                        className="space-y-4"
+                      >
+                        <ProviderList
+                          providers={providers}
+                          currentProviderId={currentProviderId}
+                          appId={activeApp}
+                          isLoading={isLoading}
+                          isProxyRunning={isProxyRunning}
+                          isProxyTakeover={
+                            isProxyRunning && isCurrentAppTakeoverActive
+                          }
+                          activeProviderId={activeProviderId}
+                          onSwitch={switchProvider}
+                          onEdit={(provider) => {
+                            setEditingProvider(provider);
+                          }}
+                          onDelete={(provider) =>
+                            setConfirmAction({ provider, action: "delete" })
+                          }
+                          onRemoveFromConfig={
+                            activeApp === "opencode" || activeApp === "openclaw"
+                              ? (provider) =>
+                                  setConfirmAction({ provider, action: "remove" })
+                              : undefined
+                          }
+                          onDisableOmo={
+                            activeApp === "opencode" ? handleDisableOmo : undefined
+                          }
+                          onDisableOmoSlim={
+                            activeApp === "opencode"
+                              ? handleDisableOmoSlim
+                              : undefined
+                          }
+                          onDuplicate={handleDuplicateProvider}
+                          onConfigureUsage={setUsageProvider}
+                          onOpenWebsite={handleOpenWebsite}
+                          onOpenTerminal={
+                            activeApp === "claude" ? handleOpenTerminal : undefined
+                          }
+                          onCreate={() => setIsAddOpen(true)}
+                          onSetAsDefault={
+                            activeApp === "openclaw" ? setAsDefaultModel : undefined
+                          }
+                        />
+                      </motion.div>
+                    </AnimatePresence>
+                  </TabsContent>
+
+                  <TabsContent value="projectMapping" className="mt-0">
+                    <motion.div
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.3 }}
+                    >
+                      {!isProxyRunning && (
+                        <div className="p-4 rounded-xl bg-gradient-to-r from-yellow-500/10 to-amber-500/5 border border-yellow-500/20 mb-6">
+                          <div className="flex items-start gap-3">
+                            <AlertTriangle className="h-5 w-5 text-yellow-500 mt-0.5 flex-shrink-0" />
+                            <div>
+                              <p className="text-sm font-medium text-yellow-700 dark:text-yellow-400">
+                                {t("projectMapping.proxyRequired", {
+                                  defaultValue: "需要先启动代理服务才能使用项目目录映射功能",
+                                })}
+                              </p>
+                              <p className="text-xs text-yellow-600/80 dark:text-yellow-400/80 mt-1">
+                                {t("projectMapping.proxyRequiredHint", {
+                                  defaultValue: "代理服务运行后，系统将自动根据项目目录匹配对应的AI供应商",
+                                })}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="rounded-xl glass-card overflow-hidden border border-border/50">
+                        <div className="p-6">
+                          <Tabs defaultValue="claude" className="w-full">
+                            <TabsList className="grid w-full grid-cols-3 mb-6 bg-muted/60 p-1 rounded-lg">
+                              <TabsTrigger value="claude" className="gap-2 data-[state=active]:bg-purple-500 data-[state=active]:text-white data-[state=inactive]:text-foreground/70 data-[state=inactive]:hover:text-foreground rounded-md transition-all">
+                                <span className="h-2 w-2 rounded-full bg-purple-400" />
+                                <span className="font-medium">Claude</span>
+                              </TabsTrigger>
+                              <TabsTrigger value="codex" className="gap-2 data-[state=active]:bg-green-500 data-[state=active]:text-white data-[state=inactive]:text-foreground/70 data-[state=inactive]:hover:text-foreground rounded-md transition-all">
+                                <span className="h-2 w-2 rounded-full bg-green-400" />
+                                <span className="font-medium">Codex</span>
+                              </TabsTrigger>
+                              <TabsTrigger value="gemini" className="gap-2 data-[state=active]:bg-blue-500 data-[state=active]:text-white data-[state=inactive]:text-foreground/70 data-[state=inactive]:hover:text-foreground rounded-md transition-all">
+                                <span className="h-2 w-2 rounded-full bg-blue-400" />
+                                <span className="font-medium">Gemini</span>
+                              </TabsTrigger>
+                            </TabsList>
+
+                            <div className="bg-muted/30 rounded-lg p-4">
+                              <TabsContent value="claude" className="mt-0">
+                                <ProjectMappingPanel appType="claude" disabled={!isProxyRunning} />
+                              </TabsContent>
+                              <TabsContent value="codex" className="mt-0">
+                                <ProjectMappingPanel appType="codex" disabled={!isProxyRunning} />
+                              </TabsContent>
+                              <TabsContent value="gemini" className="mt-0">
+                                <ProjectMappingPanel appType="gemini" disabled={!isProxyRunning} />
+                              </TabsContent>
+                            </div>
+                          </Tabs>
+                        </div>
+                      </div>
+                    </motion.div>
+                  </TabsContent>
+                </Tabs>
               </div>
             </div>
           );

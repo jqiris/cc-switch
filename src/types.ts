@@ -547,3 +547,20 @@ export interface OpenClawToolsConfig {
   deny?: string[];
   [key: string]: unknown; // preserve unknown fields
 }
+
+// ============================================================================
+// 项目目录映射（Project Directory Mapping）- v3.13.0
+// ============================================================================
+
+// 项目目录 → Provider 映射配置
+export interface ProjectProviderMapping {
+  id: string;
+  projectPath: string;
+  displayName?: string;
+  appType: string;
+  providerId: string;
+  enabled: boolean;
+  priority: number;
+  createdAt: number;
+  updatedAt: number;
+}

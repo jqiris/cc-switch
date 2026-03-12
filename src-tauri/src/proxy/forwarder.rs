@@ -102,6 +102,10 @@ pub struct RequestForwarder {
     optimizer_config: OptimizerConfig,
     /// 非流式请求超时（秒）
     non_streaming_timeout: std::time::Duration,
+    /// 当前 Provider 是否是通过项目目录映射匹配到的
+    ///
+    /// 如果为 true，请求成功后不应该触发全局供应商切换
+    is_project_mapped_provider: bool,
 }
 
 impl RequestForwarder {
@@ -118,6 +122,7 @@ impl RequestForwarder {
         _streaming_idle_timeout: u64,
         rectifier_config: RectifierConfig,
         optimizer_config: OptimizerConfig,
+        is_project_mapped_provider: bool,
     ) -> Self {
         Self {
             router,
@@ -129,6 +134,7 @@ impl RequestForwarder {
             rectifier_config,
             optimizer_config,
             non_streaming_timeout: std::time::Duration::from_secs(non_streaming_timeout),
+            is_project_mapped_provider,
         }
     }
 
@@ -254,7 +260,8 @@ impl RequestForwarder {
                         status.success_requests += 1;
                         status.last_error = None;
                         let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
+                            self.current_provider_id_at_start.as_str() != provider.id.as_str()
+                            && !self.is_project_mapped_provider;
                         if should_switch {
                             status.failover_count += 1;
 

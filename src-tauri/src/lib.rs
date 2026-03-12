@@ -1021,6 +1021,14 @@ pub fn run() {
             commands::remove_from_failover_queue,
             commands::get_auto_failover_enabled,
             commands::set_auto_failover_enabled,
+            // Project directory mapping
+            commands::get_all_project_mappings,
+            commands::get_project_mappings_for_app,
+            commands::save_project_mapping,
+            commands::delete_project_mapping,
+            commands::get_project_mapping_by_id,
+            commands::refresh_session_cache,
+            commands::get_session_cache_size,
             // Usage statistics
             commands::get_usage_summary,
             commands::get_usage_trends,
