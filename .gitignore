@@ -26,3 +26,4 @@ flatpak-repo/
 .omc/
 logs/
 .worktrees/
+.spec-workflow/

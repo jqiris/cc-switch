@@ -295,9 +295,13 @@ export const hasApiKeyField = (
 export const setApiKeyInConfig = (
   jsonString: string,
   apiKey: string,
-  options: { createIfMissing?: boolean; appType?: string } = {},
+  options: {
+    createIfMissing?: boolean;
+    appType?: string;
+    apiKeyField?: string;
+  } = {},
 ): string => {
-  const { createIfMissing = false, appType } = options;
+  const { createIfMissing = false, appType, apiKeyField } = options;
   try {
     const config = JSON.parse(jsonString);
 
@@ -337,13 +341,13 @@ export const setApiKeyInConfig = (
       return JSON.stringify(config, null, 2);
     }
 
-    // Claude API Key (优先写入已存在的字段；若两者均不存在且允许创建，则默认创建 AUTH_TOKEN 字段)
+    // Claude API Key (优先写入已存在的字段；若两者均不存在且允许创建，则使用 apiKeyField 或默认 AUTH_TOKEN 字段)
     if ("ANTHROPIC_AUTH_TOKEN" in env) {
       env.ANTHROPIC_AUTH_TOKEN = apiKey;
     } else if ("ANTHROPIC_API_KEY" in env) {
       env.ANTHROPIC_API_KEY = apiKey;
     } else if (createIfMissing) {
-      env.ANTHROPIC_AUTH_TOKEN = apiKey;
+      env[apiKeyField ?? "ANTHROPIC_AUTH_TOKEN"] = apiKey;
     } else {
       return jsonString;
     }
@@ -447,11 +451,22 @@ export const setCodexBaseUrl = (
   baseUrl: string,
 ): string => {
   const trimmed = baseUrl.trim();
-  if (!trimmed) {
-    return configText;
-  }
   // 归一化原文本中的引号（既能匹配，也能输出稳定格式）
   const normalizedText = normalizeQuotes(configText);
+
+  // 允许清空：当 baseUrl 为空时，移除 base_url 行
+  if (!trimmed) {
+    if (!normalizedText) return normalizedText;
+    const next = normalizedText
+      .split("\n")
+      .filter((line) => !/^\s*base_url\s*=/.test(line))
+      .join("\n")
+      // 避免移除后留下过多空行
+      .replace(/\n{3,}/g, "\n\n")
+      // 避免开头出现空行
+      .replace(/^\n+/, "");
+    return next;
+  }
 
   const normalizedUrl = trimmed.replace(/\s+/g, "");
   const replacementLine = `base_url = "${normalizedUrl}"`;
@@ -494,12 +509,20 @@ export const setCodexModelName = (
   modelName: string,
 ): string => {
   const trimmed = modelName.trim();
-  if (!trimmed) {
-    return configText;
-  }
-
   // 归一化原文本中的引号（既能匹配，也能输出稳定格式）
   const normalizedText = normalizeQuotes(configText);
+
+  // 允许清空：当 modelName 为空时，移除 model 行
+  if (!trimmed) {
+    if (!normalizedText) return normalizedText;
+    const next = normalizedText
+      .split("\n")
+      .filter((line) => !/^\s*model\s*=/.test(line))
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/^\n+/, "");
+    return next;
+  }
 
   const replacementLine = `model = "${trimmed}"`;
   const pattern = /^model\s*=\s*["']([^"']+)["']/m;
