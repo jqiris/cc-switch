@@ -149,14 +149,13 @@ impl RequestContext {
         let provider = provider
             .ok_or(ProxyError::NoAvailableProvider)?;
 
-        log::debug!(
-            "[{}] Provider: {}, model: {}, failover chain: {} providers, session: {}, project_mapped: {}",
+        log::info!(
+            "[{}] 使用 Provider: {} (model: {}, project_mapped: {}, failover_chain: {})",
             tag,
             provider.name,
             request_model,
-            providers.len(),
-            session_id,
-            is_project_mapped_provider
+            is_project_mapped_provider,
+            providers.len()
         );
 
         Ok(Self {

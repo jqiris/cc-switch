@@ -47,7 +47,9 @@ export function useSaveProjectMapping() {
     mutationFn: (mapping: ProjectProviderMapping) =>
       projectMappingApi.save(mapping),
     onSuccess: () => {
+      // 刷新映射列表和 Session 缓存状态
       queryClient.invalidateQueries({ queryKey: ["projectMappings"] });
+      queryClient.invalidateQueries({ queryKey: ["sessionCacheSize"] });
       toast.success(
         t("projectMapping.saveSuccess", { defaultValue: "项目映射已保存" }),
         { closeButton: true },
@@ -73,7 +75,9 @@ export function useDeleteProjectMapping() {
   return useMutation({
     mutationFn: (id: string) => projectMappingApi.delete(id),
     onSuccess: () => {
+      // 刷新映射列表和 Session 缓存状态
       queryClient.invalidateQueries({ queryKey: ["projectMappings"] });
+      queryClient.invalidateQueries({ queryKey: ["sessionCacheSize"] });
       toast.success(
         t("projectMapping.deleteSuccess", { defaultValue: "项目映射已删除" }),
         { closeButton: true },

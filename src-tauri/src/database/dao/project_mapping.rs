@@ -190,15 +190,7 @@ impl Database {
     ) -> Result<Option<ProjectProviderMapping>, AppError> {
         let mappings = self.get_project_mappings_for_app(app_type)?;
 
-        log::debug!(
-            "[ProjectMapping] 尝试匹配: path={}, app_type={}, 可用映射数={}",
-            project_path,
-            app_type,
-            mappings.len()
-        );
-
         if mappings.is_empty() {
-            log::warn!("[ProjectMapping] 没有找到 app_type={} 的启用映射", app_type);
             return Ok(None);
         }
 
@@ -210,7 +202,7 @@ impl Database {
             let normalized_config_path = mapping.project_path.replace('\\', "/").to_lowercase();
             if normalized_config_path == normalized_path {
                 log::info!(
-                    "[ProjectMapping] 精确匹配成功: {} -> provider {}",
+                    "[ProjectMapping] 精确匹配: {} -> provider {}",
                     project_path,
                     mapping.provider_id
                 );
@@ -220,12 +212,12 @@ impl Database {
 
         // 2. 尝试 glob 模式匹配
         for mapping in &mappings {
-            // 对于 glob，需要转换路径分隔符
             let pattern_str = mapping.project_path.replace('\\', "/");
             if let Ok(pattern) = glob::Pattern::new(&pattern_str) {
+                // glob 匹配也使用小写路径
                 if pattern.matches(&normalized_path) {
                     log::info!(
-                        "[ProjectMapping] Glob 匹配成功: {} (pattern={}) -> provider {}",
+                        "[ProjectMapping] Glob匹配: {} (pattern={}) -> provider {}",
                         project_path,
                         mapping.project_path,
                         mapping.provider_id
@@ -240,7 +232,7 @@ impl Database {
             let normalized_config_path = mapping.project_path.replace('\\', "/").to_lowercase();
             if normalized_path.starts_with(&normalized_config_path) {
                 log::info!(
-                    "[ProjectMapping] 前缀匹配成功: {} (prefix={}) -> provider {}",
+                    "[ProjectMapping] 前缀匹配: {} (prefix={}) -> provider {}",
                     project_path,
                     mapping.project_path,
                     mapping.provider_id
@@ -248,12 +240,6 @@ impl Database {
                 return Ok(Some(mapping.clone()));
             }
         }
-
-        log::debug!(
-            "[ProjectMapping] 未找到匹配: path={}, 检查过的映射: {:?}",
-            project_path,
-            mappings.iter().map(|m| &m.project_path).collect::<Vec<_>>()
-        );
 
         Ok(None)
     }

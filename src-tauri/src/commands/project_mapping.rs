@@ -37,7 +37,13 @@ pub async fn save_project_mapping(
     state
         .db
         .save_project_mapping(&mapping)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // 保存后自动刷新 SessionCache，确保映射能立即生效
+    let cache = crate::services::SessionCache::instance();
+    cache.scan_sessions().await;
+
+    Ok(())
 }
 
 /// 删除项目映射配置
@@ -49,7 +55,13 @@ pub async fn delete_project_mapping(
     state
         .db
         .delete_project_mapping(&id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    // 删除后也刷新 SessionCache，保持状态一致
+    let cache = crate::services::SessionCache::instance();
+    cache.scan_sessions().await;
+
+    Ok(())
 }
 
 /// 根据 ID 获取项目映射配置
