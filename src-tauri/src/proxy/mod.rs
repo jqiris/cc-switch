@@ -20,6 +20,7 @@ pub mod provider_router;
 pub mod providers;
 pub mod response_handler;
 pub mod response_processor;
+pub mod smart_router;
 pub(crate) mod server;
 pub mod session;
 pub mod thinking_budget_rectifier;
