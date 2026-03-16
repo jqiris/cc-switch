@@ -229,6 +229,7 @@ impl RequestForwarder {
                     &provider_body,
                     &headers,
                     adapter.as_ref(),
+                    app_type_str,
                 )
                 .await
             {
@@ -358,6 +359,7 @@ impl RequestForwarder {
                                         &provider_body,
                                         &headers,
                                         adapter.as_ref(),
+                                        app_type_str,
                                     )
                                     .await
                                 {
@@ -555,6 +557,7 @@ impl RequestForwarder {
                                     &provider_body,
                                     &headers,
                                     adapter.as_ref(),
+                                    app_type_str,
                                 )
                                 .await
                             {
@@ -792,6 +795,7 @@ impl RequestForwarder {
         body: &Value,
         headers: &axum::http::HeaderMap,
         adapter: &dyn ProviderAdapter,
+        app_type_str: &str,
     ) -> Result<Response, ProxyError> {
         // 使用适配器提取 base_url
         let base_url = adapter.extract_base_url(provider)?;
@@ -815,9 +819,22 @@ impl RequestForwarder {
         // 使用适配器构建 URL
         let url = adapter.build_url(&base_url, effective_endpoint);
 
+        // === 技能触发检测 ===
+        // 检测用户消息中的触发关键词，自动注入已安装的技能内容
+        let (body_with_skills, triggered_skill) =
+            super::skill_trigger::detect_and_inject_skill(body.clone(), app_type_str).await;
+
+        if let Some(ref skill) = triggered_skill {
+            log::info!(
+                "[SkillTrigger] 技能触发: {} (关键词: '{}')",
+                skill.name,
+                skill.matched_trigger
+            );
+        }
+
         // 应用模型映射（独立于格式转换）
         let (mapped_body, _original_model, _mapped_model) =
-            super::model_mapper::apply_model_mapping(body.clone(), provider);
+            super::model_mapper::apply_model_mapping(body_with_skills, provider);
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mapped_body = normalize_thinking_type(mapped_body);

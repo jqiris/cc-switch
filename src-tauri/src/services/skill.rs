@@ -184,6 +184,12 @@ const SKILL_BACKUP_RETAIN_COUNT: usize = 20;
 pub struct SkillMetadata {
     pub name: Option<String>,
     pub description: Option<String>,
+    /// 触发关键词列表
+    #[serde(default)]
+    pub triggers: Vec<String>,
+    /// 技能 ID
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// 导入已有 Skill 时，前端显式提交的启用应用选择
@@ -1419,8 +1425,8 @@ impl SkillService {
         Self::parse_skill_metadata_static(path)
     }
 
-    /// 静态方法：解析技能元数据
-    fn parse_skill_metadata_static(path: &Path) -> Result<SkillMetadata> {
+    /// 静态方法：解析技能元数据（公开接口）
+    pub fn parse_skill_metadata_static(path: &Path) -> Result<SkillMetadata> {
         let content = fs::read_to_string(path)?;
         let content = content.trim_start_matches('\u{feff}');
 
@@ -1429,6 +1435,8 @@ impl SkillService {
             return Ok(SkillMetadata {
                 name: None,
                 description: None,
+                triggers: Vec::new(),
+                id: None,
             });
         }
 
@@ -1436,6 +1444,8 @@ impl SkillService {
         let meta: SkillMetadata = serde_yaml::from_str(front_matter).unwrap_or(SkillMetadata {
             name: None,
             description: None,
+            triggers: Vec::new(),
+            id: None,
         });
 
         Ok(meta)

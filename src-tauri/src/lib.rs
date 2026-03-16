@@ -409,6 +409,14 @@ pub fn run() {
                 Err(e) => log::warn!("✗ Failed to initialize default skill repos: {e}"),
             }
 
+            // 1.1. 初始化技能触发缓存（异步）
+            {
+                let db = app_state.db.clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::proxy::skill_trigger::init_skill_trigger_cache(&db).await;
+                });
+            }
+
             // 1.1. Skills 统一管理迁移：当数据库迁移到 v3 结构后，自动从各应用目录导入到 SSOT
             // 触发条件由 schema 迁移设置 settings.skills_ssot_migration_pending = true 控制。
             match app_state.db.get_setting("skills_ssot_migration_pending") {

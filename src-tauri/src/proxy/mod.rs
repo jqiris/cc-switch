@@ -21,6 +21,7 @@ pub mod providers;
 pub mod response_handler;
 pub mod response_processor;
 pub mod smart_router;
+pub mod skill_trigger;
 pub(crate) mod server;
 pub mod session;
 pub mod thinking_budget_rectifier;
