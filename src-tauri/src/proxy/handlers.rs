@@ -465,6 +465,28 @@ pub async fn handle_gemini(
 // 使用量记录（保留用于 Claude 转换逻辑）
 // ============================================================================
 
+/// 判断是否应该跳过数据库日志记录
+///
+/// 对于某些供应商错误（如余额不足、配额用尽），跳过数据库记录以避免噪音
+fn should_skip_db_logging(error: &ProxyError, status_code: u16) -> bool {
+    // 跳过 429 错误（通常是余额不足、配额用尽等供应商侧问题）
+    if status_code == 429 {
+        return true;
+    }
+
+    // 跳过某些特定的上游错误
+    if let ProxyError::UpstreamError { body, .. } = error {
+        if let Some(ref msg) = body {
+            // zhipu AI 的余额不足错误
+            if msg.contains("余额不足") || msg.contains("无可用资源包") {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 fn log_forward_error(
     state: &ProxyState,
     ctx: &RequestContext,
@@ -476,6 +498,18 @@ fn log_forward_error(
     let logger = UsageLogger::new(&state.db);
     let status_code = map_proxy_error_to_status(error);
     let error_message = get_error_message(error);
+
+    // 对于某些错误类型，跳过数据库记录，只记录日志
+    if should_skip_db_logging(error, status_code) {
+        log::debug!(
+            "[{}] 跳过数据库记录: status={}, error={}",
+            ctx.app_type_str,
+            status_code,
+            error_message
+        );
+        return;
+    }
+
     let request_id = uuid::Uuid::new_v4().to_string();
 
     if let Err(e) = logger.log_error_with_context(

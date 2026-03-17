@@ -28,6 +28,9 @@ use tokio::sync::Mutex;
 // ============================================================================
 
 /// 检测响应是否为 SSE 流式响应
+///
+/// 对于 4xx/5xx 错误响应，即使请求是流式的，上游也可能返回非流式 JSON
+/// 此函数仅基于 content-type 判断，不依赖 HTTP 状态码
 #[inline]
 pub fn is_sse_response(response: &reqwest::Response) -> bool {
     response
@@ -36,6 +39,12 @@ pub fn is_sse_response(response: &reqwest::Response) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|ct| ct.contains("text/event-stream"))
         .unwrap_or(false)
+}
+
+/// 检测响应是否为错误响应
+#[inline]
+fn is_error_response(status: axum::http::StatusCode) -> bool {
+    status.as_u16() >= 400
 }
 
 /// 处理流式响应
@@ -114,6 +123,8 @@ pub async fn handle_non_streaming(
     );
 
     // 解析并记录使用量
+    let is_error = is_error_response(status);
+
     if let Ok(json_value) = serde_json::from_slice::<Value>(&body_bytes) {
         // 解析使用量
         if let Some(usage) = (parser_config.response_parser)(&json_value) {
@@ -136,40 +147,63 @@ pub async fn handle_non_streaming(
                 false,
             );
         } else {
-            let model = json_value
-                .get("model")
-                .and_then(|m| m.as_str())
-                .unwrap_or(&ctx.request_model)
-                .to_string();
+            // 使用量解析失败
+            if is_error {
+                // 错误响应：不记录 usage（避免误导性的 0 token 记录）
+                log::debug!(
+                    "[{}] 错误响应 (status={}) 无 usage 信息，跳过使用量记录",
+                    parser_config.app_type_str,
+                    status.as_u16()
+                );
+            } else {
+                // 非错误响应但没有 usage：可能是格式兼容性问题，记录 0 以便于调试
+                let model = json_value
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(&ctx.request_model)
+                    .to_string();
+                log::debug!(
+                    "[{}] 成功响应 (status={}) 无法解析 usage，响应 keys: {:?}",
+                    parser_config.app_type_str,
+                    status.as_u16(),
+                    json_value.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                );
+                spawn_log_usage(
+                    state,
+                    ctx,
+                    TokenUsage::default(),
+                    &model,
+                    &ctx.request_model,
+                    status.as_u16(),
+                    false,
+                );
+            }
+        }
+    } else {
+        // 非 JSON 响应
+        if is_error {
+            log::debug!(
+                "[{}] 错误响应 (status={}) 非 JSON 格式，跳过使用量记录",
+                parser_config.app_type_str,
+                status.as_u16()
+            );
+        } else {
+            log::debug!(
+                "[{}] 成功响应 (status={}) 非 JSON 格式: {} bytes",
+                parser_config.app_type_str,
+                status.as_u16(),
+                body_bytes.len()
+            );
             spawn_log_usage(
                 state,
                 ctx,
                 TokenUsage::default(),
-                &model,
+                &ctx.request_model,
                 &ctx.request_model,
                 status.as_u16(),
                 false,
             );
-            log::debug!(
-                "[{}] 未能解析 usage 信息，跳过记录",
-                parser_config.app_type_str
-            );
         }
-    } else {
-        log::debug!(
-            "[{}] <<< 响应 (非 JSON): {} bytes",
-            ctx.tag,
-            body_bytes.len()
-        );
-        spawn_log_usage(
-            state,
-            ctx,
-            TokenUsage::default(),
-            &ctx.request_model,
-            &ctx.request_model,
-            status.as_u16(),
-            false,
-        );
     }
 
     // 构建响应
@@ -297,6 +331,7 @@ fn create_usage_collector(
     let stream_parser = parser_config.stream_parser;
     let model_extractor = parser_config.model_extractor;
     let session_id = ctx.session_id.clone();
+    let is_error = status_code >= 400;
 
     SseUsageCollector::new(start_time, move |events, first_token_ms| {
         if !logging_enabled {
@@ -328,30 +363,40 @@ fn create_usage_collector(
                 .await;
             });
         } else {
-            let model = model_extractor(&events, &request_model);
-            let latency_ms = start_time.elapsed().as_millis() as u64;
-            let state = state.clone();
-            let provider_id = provider_id.clone();
-            let session_id = session_id.clone();
-            let request_model = request_model.clone();
+            // 流式响应缺少 usage 统计
+            if is_error {
+                // 错误响应：不记录 usage（避免误导性的 0 token 记录）
+                log::debug!(
+                    "[{tag}] 流式错误响应 (status={}) 缺少 usage 统计，跳过消费记录",
+                    status_code
+                );
+            } else {
+                // 非错误响应但没有 usage：记录 0 以便于调试格式兼容性问题
+                let model = model_extractor(&events, &request_model);
+                let latency_ms = start_time.elapsed().as_millis() as u64;
+                let state = state.clone();
+                let provider_id = provider_id.clone();
+                let session_id = session_id.clone();
+                let request_model = request_model.clone();
 
-            tokio::spawn(async move {
-                log_usage_internal(
-                    &state,
-                    &provider_id,
-                    app_type_str,
-                    &model,
-                    &request_model,
-                    TokenUsage::default(),
-                    latency_ms,
-                    first_token_ms,
-                    true, // is_streaming
-                    status_code,
-                    Some(session_id),
-                )
-                .await;
-            });
-            log::debug!("[{tag}] 流式响应缺少 usage 统计，跳过消费记录");
+                tokio::spawn(async move {
+                    log_usage_internal(
+                        &state,
+                        &provider_id,
+                        app_type_str,
+                        &model,
+                        &request_model,
+                        TokenUsage::default(),
+                        latency_ms,
+                        first_token_ms,
+                        true, // is_streaming
+                        status_code,
+                        Some(session_id),
+                    )
+                    .await;
+                });
+                log::debug!("[{tag}] 流式响应缺少 usage 统计，记录 0 token 用于调试");
+            }
         }
     })
 }
@@ -755,5 +800,31 @@ mod tests {
             Decimal::from_str("1.5").unwrap()
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_is_error_response() {
+        use super::is_error_response;
+        use axum::http::StatusCode;
+
+        // 2xx - 成功，不是错误
+        assert!(!is_error_response(StatusCode::OK));
+        assert!(!is_error_response(StatusCode::CREATED));
+        assert!(!is_error_response(StatusCode::ACCEPTED));
+
+        // 3xx - 重定向，不是错误
+        assert!(!is_error_response(StatusCode::MOVED_PERMANENTLY));
+        assert!(!is_error_response(StatusCode::FOUND));
+
+        // 4xx - 客户端错误
+        assert!(is_error_response(StatusCode::BAD_REQUEST));
+        assert!(is_error_response(StatusCode::UNAUTHORIZED));
+        assert!(is_error_response(StatusCode::FORBIDDEN));
+        assert!(is_error_response(StatusCode::NOT_FOUND));
+
+        // 5xx - 服务器错误
+        assert!(is_error_response(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_error_response(StatusCode::BAD_GATEWAY));
+        assert!(is_error_response(StatusCode::SERVICE_UNAVAILABLE));
     }
 }
