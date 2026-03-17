@@ -162,27 +162,6 @@ impl SessionCache {
         );
     }
 
-    /// 手动更新单个 session 的 cwd（用于实时更新）
-    pub async fn update_session(&self, session_id: String, cwd: String) {
-        let mut cache = self.cache.write().await;
-        cache.insert(
-            session_id,
-            SessionMeta {
-                cwd,
-                updated_at: Instant::now(),
-            },
-        );
-    }
-
-    /// 清除缓存
-    pub async fn clear(&self) {
-        let mut cache = self.cache.write().await;
-        cache.clear();
-
-        let mut last_scan = self.last_scan.write().await;
-        *last_scan = None;
-    }
-
     /// 获取缓存大小
     pub async fn size(&self) -> usize {
         self.cache.read().await.len()

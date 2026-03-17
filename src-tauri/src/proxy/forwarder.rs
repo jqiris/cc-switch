@@ -821,16 +821,12 @@ impl RequestForwarder {
 
         // === 技能触发检测 ===
         // 检测用户消息中的触发关键词，自动注入已安装的技能内容
-        let (body_with_skills, triggered_skill) =
-            super::skill_trigger::detect_and_inject_skill(body.clone(), app_type_str).await;
+        // 详细日志由 skill_trigger 模块内部打印
+        let (body_with_skills, triggered_skills) =
+            super::skill_trigger::detect_and_inject_skill(body.clone(), app_type_str, None).await;
 
-        if let Some(ref skill) = triggered_skill {
-            log::info!(
-                "[SkillTrigger] 技能触发: {} (关键词: '{}')",
-                skill.name,
-                skill.matched_trigger
-            );
-        }
+        // 技能触发结果已在 detect_and_inject_skill 内部打印，这里仅做记录
+        let _ = triggered_skills; // 避免未使用变量警告
 
         // 应用模型映射（独立于格式转换）
         let (mapped_body, _original_model, _mapped_model) =

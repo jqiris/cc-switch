@@ -2,6 +2,8 @@
 //!
 //! 提供本地HTTP代理服务，支持多Provider故障转移和请求透传
 
+pub mod auto_invoke;
+pub mod auto_learner;
 pub mod body_filter;
 pub mod cache_injector;
 pub mod circuit_breaker;
@@ -20,10 +22,10 @@ pub mod provider_router;
 pub mod providers;
 pub mod response_handler;
 pub mod response_processor;
-pub mod smart_router;
 pub mod skill_trigger;
 pub(crate) mod server;
 pub mod session;
+pub mod smart_router;
 pub mod thinking_budget_rectifier;
 pub mod thinking_optimizer;
 pub mod thinking_rectifier;
