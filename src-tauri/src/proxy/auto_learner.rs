@@ -8,6 +8,8 @@
 //! - 技能价值评分
 //! - 触发词自动生成
 //! - 标签自动推断
+
+#![allow(dead_code)] // Partially implemented feature - reserved for future use
 //! - 基于频率的去重和排序
 
 use std::collections::HashMap;

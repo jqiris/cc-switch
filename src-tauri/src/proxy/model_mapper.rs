@@ -16,6 +16,19 @@ pub struct ModelMapping {
 }
 
 impl ModelMapping {
+    /// 检查 provider 是否直接支持指定模型
+    ///
+    /// 这用于跳过不必要的智能路由：
+    /// - 如果用户请求的模型是 provider 配置中的模型之一，直接使用
+    /// - 避免将 "glm-5-turbo" 路由到其他模型
+    pub fn has_model(&self, model: &str) -> bool {
+        self.haiku_model.as_deref() == Some(model)
+            || self.sonnet_model.as_deref() == Some(model)
+            || self.opus_model.as_deref() == Some(model)
+            || self.default_model.as_deref() == Some(model)
+            || self.reasoning_model.as_deref() == Some(model)
+    }
+
     /// 检查是否应该使用智能路由
     ///
     /// 智能路由启用的条件：
@@ -233,6 +246,34 @@ pub fn apply_model_mapping(
     };
 
     let has_thinking = has_thinking_enabled(&body);
+
+    // === 特殊处理：thinking 模式优先使用 reasoning_model ===
+    // reasoning_model 是专门用于复杂推理的模型，优先级高于智能路由
+    if has_thinking {
+        if let Some(reasoning_model) = &mapping.reasoning_model {
+            log::info!(
+                "[ModelMapper] Thinking 模式使用 reasoning_model: {}",
+                reasoning_model
+            );
+            if reasoning_model != original {
+                body["model"] = serde_json::json!(reasoning_model);
+                return (body, Some(original.to_string()), Some(reasoning_model.clone()));
+            }
+            return (body, Some(original.to_string()), None);
+        }
+    }
+
+    // === 特殊处理：检查 provider 是否直接支持请求的模型 ===
+    // 如果请求的模型是 provider 配置中的模型之一，直接使用，不经过智能路由
+    let provider_has_model = mapping.has_model(original);
+
+    if provider_has_model {
+        log::debug!(
+            "[ModelMapper] Provider '{}' 直接支持请求的模型 '{}', 跳过智能路由",
+            provider.name, original
+        );
+        return (body, Some(original.to_string()), None);
+    }
 
     // === 智能路由优先路径 ===
     // 如果配置了层级模型（haiku/sonnet/opus），启用智能路由
@@ -1253,5 +1294,202 @@ mod tests {
         // thinking 模式优先使用 reasoning_model (glm-5-turbo)
         assert_eq!(result["model"], "glm-5-turbo");
         assert_eq!(mapped, Some("glm-5-turbo".to_string()));
+    }
+
+    // =========================================================================
+    // 新增测试：验证 has_model() 和跳过智能路由的逻辑
+    // =========================================================================
+
+    #[test]
+    fn test_has_model_detects_all_configured_models() {
+        let provider = Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus-model",
+                    "ANTHROPIC_MODEL": "default-model",
+                    "ANTHROPIC_REASONING_MODEL": "reasoning-model"
+                }
+            }),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        let mapping = ModelMapping::from_provider(&provider);
+
+        // 所有配置的模型都应该被识别
+        assert!(mapping.has_model("haiku-model"));
+        assert!(mapping.has_model("sonnet-model"));
+        assert!(mapping.has_model("opus-model"));
+        assert!(mapping.has_model("default-model"));
+        assert!(mapping.has_model("reasoning-model"));
+
+        // 未配置的模型不应该被识别
+        assert!(!mapping.has_model("unknown-model"));
+        assert!(!mapping.has_model("glm-5-turbo"));
+    }
+
+    #[test]
+    fn test_provider_directly_supports_requested_model_skip_smart_routing() {
+        // 模拟 baidu-mix 场景：provider 配置了 glm-5，用户请求 glm-5
+        let provider = Provider {
+            id: "baidu-mix".to_string(),
+            name: "baidu-mix".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "minimax-m2.5",
+                    "ANTHROPIC_MODEL": "deepseek-v3.2",
+                    "ANTHROPIC_REASONING_MODEL": "glm-5"
+                }
+            }),
+            website_url: Some("https://cloud.baidu.com/".to_string()),
+            category: None,
+            created_at: Some(1773237487448),
+            sort_index: Some(1),
+            notes: None,
+            meta: Some(serde_json::from_str(r#"{"commonConfigEnabled":true,"endpointAutoSelect":true,"apiFormat":"anthropic"}"#).unwrap()),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        // 用户请求 glm-5，这是 provider 直接支持的模型
+        let body = json!({
+            "model": "glm-5",
+            "messages": [{"role": "user", "content": "测试"}]
+        });
+
+        let (result, original, mapped) = apply_model_mapping(body, &provider);
+
+        // 应该直接使用 glm-5，不经过智能路由
+        assert_eq!(result["model"], "glm-5");
+        assert_eq!(original, Some("glm-5".to_string()));
+        assert_eq!(mapped, None); // 没有映射，直接使用原模型
+    }
+
+    #[test]
+    fn test_thinking_mode_uses_reasoning_model_when_available() {
+        // baidu-mix 场景：thinking 模式应该使用 reasoning_model (glm-5)
+        let provider = Provider {
+            id: "baidu-mix".to_string(),
+            name: "baidu-mix".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "minimax-m2.5",
+                    "ANTHROPIC_MODEL": "deepseek-v3.2",
+                    "ANTHROPIC_REASONING_MODEL": "glm-5"
+                }
+            }),
+            website_url: Some("https://cloud.baidu.com/".to_string()),
+            category: None,
+            created_at: Some(1773237487448),
+            sort_index: Some(1),
+            notes: None,
+            meta: Some(serde_json::from_str(r#"{"commonConfigEnabled":true,"endpointAutoSelect":true,"apiFormat":"anthropic"}"#).unwrap()),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+
+        // thinking 模式启用，请求的是其他模型
+        let body = json!({
+            "model": "minimax-m2.5",
+            "thinking": {"type": "enabled"},
+            "messages": [{"role": "user", "content": "复杂推理问题"}]
+        });
+
+        let (result, original, mapped) = apply_model_mapping(body, &provider);
+
+        // thinking 模式应该使用 reasoning_model (glm-5)
+        assert_eq!(result["model"], "glm-5");
+        assert_eq!(original, Some("minimax-m2.5".to_string()));
+        assert_eq!(mapped, Some("glm-5".to_string()));
+    }
+
+    #[test]
+    fn test_unsupported_model_passes_through_when_no_smart_routing() {
+        // provider 没有配置层级模型，也不支持请求的模型
+        let provider = Provider {
+            id: "simple".to_string(),
+            name: "Simple".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_MODEL": "default-model"
+                }
+            }),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        let mapping = ModelMapping::from_provider(&provider);
+
+        // 没有层级模型，不应该启用智能路由
+        assert!(!mapping.has_tier_models());
+        assert!(!mapping.has_model("requested-model"));
+
+        // 请求一个不存在的模型
+        let body = json!({
+            "model": "requested-model",
+            "messages": [{"role": "user", "content": "test"}]
+        });
+
+        let (result, original, mapped) = apply_model_mapping(body, &provider);
+
+        // 应该保持原模型不变（因为没有映射配置）
+        assert_eq!(result["model"], "requested-model");
+        assert_eq!(original, Some("requested-model".to_string()));
+        assert_eq!(mapped, None);
+    }
+
+    #[test]
+    fn test_baidu_mix_does_not_support_glm_5_turbo() {
+        // 验证 baidu-mix 不支持 glm-5-turbo
+        let provider = Provider {
+            id: "baidu-mix".to_string(),
+            name: "baidu-mix".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.7",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "minimax-m2.5",
+                    "ANTHROPIC_MODEL": "deepseek-v3.2",
+                    "ANTHROPIC_REASONING_MODEL": "glm-5"
+                }
+            }),
+            website_url: Some("https://cloud.baidu.com/".to_string()),
+            category: None,
+            created_at: Some(1773237487448),
+            sort_index: Some(1),
+            notes: None,
+            meta: Some(serde_json::from_str(r#"{"commonConfigEnabled":true,"endpointAutoSelect":true,"apiFormat":"anthropic"}"#).unwrap()),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        };
+        let mapping = ModelMapping::from_provider(&provider);
+
+        // baidu-mix 不支持 glm-5-turbo
+        assert!(!mapping.has_model("glm-5-turbo"));
+        // baidu-mix 支持 glm-5
+        assert!(mapping.has_model("glm-5"));
     }
 }

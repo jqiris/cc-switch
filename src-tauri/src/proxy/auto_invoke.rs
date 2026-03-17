@@ -10,6 +10,8 @@
 //! - 调用历史记录
 //! - 自动调用使用特殊的注入格式（auto_invoke_skill）
 
+#![allow(dead_code)] // Partially implemented feature - reserved for future use
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;

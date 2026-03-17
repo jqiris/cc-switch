@@ -8,6 +8,8 @@
 //! - 置信度评分系统
 //! - 上下文提取（错误、文件、技术模式）
 //! - 多语言触发词支持
+
+#![allow(dead_code)] // Partially implemented features - validation and config fields reserved for future use
 //! - 技能优先级覆盖（项目级 > 用户级）
 //! - 触发词质量验证
 //! - 会话缓存防止重复注入
@@ -580,7 +582,9 @@ impl SkillTriggerCache {
                     quality_score: data.quality_score,
                 });
             } else {
-                log::warn!("[SkillTrigger] 技能 '{}' 无法加载元数据 (SKILL.md 不存在或格式错误)", skill.name);
+                // 已经在 load_skill_metadata 中记录了 DEBUG 日志
+                // 这里不再重复 WARN，避免对内部工具产生噪音
+                log::debug!("[SkillTrigger] 技能 '{}' 未加载（可能是内部工具或无触发词）", skill.name);
                 skipped_no_metadata += 1;
             }
         }
@@ -1173,6 +1177,15 @@ struct SkillMetadata {
 }
 
 /// 从 SKILL.md 加载技能元数据
+///
+/// 支持两种格式：
+/// 1. cc-switch 格式：显式的 `triggers` 字段
+/// 2. oh-my-claudecode 格式：从 `description` 中的 "TRIGGER when:" 部分提取
+///
+/// 返回 None 表示：
+/// - SKILL.md 不存在
+/// - 没有触发词（包括故意无触发词的内部工具）
+/// - Frontmatter 解析失败
 fn load_skill_metadata(directory: &str) -> Option<SkillMetadata> {
     let skill_path = get_ssot_skill_path(directory);
     let skill_md = skill_path.join("SKILL.md");
@@ -1186,10 +1199,19 @@ fn load_skill_metadata(directory: &str) -> Option<SkillMetadata> {
     // 解析 frontmatter
     let (frontmatter, _body) = parse_frontmatter(&content)?;
 
-    // 解析触发词
-    let triggers = parse_yaml_list(&frontmatter, "triggers");
+    // 优先使用显式的 triggers 字段（cc-switch 格式）
+    let mut triggers = parse_yaml_list(&frontmatter, "triggers");
 
+    // 如果没有 triggers 字段，尝试从 description 提取（oh-my-claudecode 格式）
     if triggers.is_empty() {
+        if let Some(description) = extract_yaml_value(&frontmatter, "description") {
+            triggers = extract_triggers_from_description(&description);
+        }
+    }
+
+    // 如果仍然没有触发词，返回 None（没有 description 的技能自然走这里）
+    if triggers.is_empty() {
+        log::debug!("[SkillTrigger] 技能 '{}' 没有找到触发词", directory);
         return None;
     }
 
@@ -1212,6 +1234,362 @@ fn load_skill_metadata(directory: &str) -> Option<SkillMetadata> {
         content_hash,
         quality_score,
     })
+}
+
+/// 从 oh-my-claudecode 格式的 description 中提取触发词
+///
+/// 支持多种模式：
+/// 1. "TRIGGER when:" ... "DO NOT TRIGGER when:" - 显式触发声明
+/// 2. "Use this when" / "Use when" - 从上下文描述中提取关键词
+/// 3. "Keywords:" - 显式关键词列表
+fn extract_triggers_from_description(description: &str) -> Vec<String> {
+    let mut triggers = Vec::new();
+
+    // ========== 模式 1: TRIGGER when: / DO NOT TRIGGER when: ==========
+    let trigger_start = description.find("TRIGGER when:")
+        .or_else(|| description.find("TRIGGER:"))
+        .or_else(|| description.find("trigger when:"))
+        .or_else(|| description.find("trigger:"));
+
+    if let Some(start) = trigger_start {
+        // 查找 "DO NOT TRIGGER when:" 或 "NOT when:" 或结束
+        let trigger_text = if let Some(not_start) = description.find("DO NOT TRIGGER when:")
+            .or_else(|| description.find("NOT when:"))
+            .or_else(|| description.find("DO NOT TRIGGER:"))
+        {
+            &description[start..not_start]
+        } else {
+            &description[start..]
+        };
+
+        // 提取反引号中的触发词
+        if let Ok(quote_pattern) = regex::Regex::new(r"`([^`]+)`") {
+            for cap in quote_pattern.captures_iter(trigger_text) {
+                if let Some(trigger) = cap.get(1) {
+                    let trigger_str = trigger.as_str().trim();
+                    if !trigger_str.is_empty() && trigger_str.len() <= 50 {
+                        triggers.push(trigger_str.to_string());
+                    }
+                }
+            }
+        }
+
+        // 匹配 imports 模式
+        if triggers.is_empty() {
+            if let Ok(import_pattern) = regex::Regex::new(
+                r#"imports?\s+`([^`]+)`|imports?\s+'([^']+)'|imports?\s+"([^"]+)""#
+            ) {
+                for cap in import_pattern.captures_iter(trigger_text) {
+                    let lib = cap.get(1).or(cap.get(2)).or(cap.get(3))
+                        .map(|m| m.as_str()).unwrap_or("");
+                    if !lib.is_empty() {
+                        triggers.push(lib.to_string());
+                    }
+                }
+            }
+        }
+
+        // 提取斜杠命令
+        if triggers.is_empty() {
+            if let Ok(slash_pattern) = regex::Regex::new(r"([a-z-]+)(?:\s+command|\s+skill)") {
+                for cap in slash_pattern.captures_iter(trigger_text) {
+                    if let Some(cmd) = cap.get(1) {
+                        triggers.push(format!("/{}", cmd.as_str()));
+                    }
+                }
+            }
+        }
+
+        // 如果找到了触发词，直接返回
+        if !triggers.is_empty() {
+            return triggers;
+        }
+    }
+
+    // ========== 模式 2: Keywords: / Triggers: 显式列表 ==========
+    let keywords_start = description.find("Keywords:")
+        .or_else(|| description.find("Triggers:")); // 支持 "Triggers:" 格式（不带 "on"）
+
+    if let Some(start) = keywords_start {
+        // 确定实际使用的模式名称，用于跳过正确长度的前缀
+        let pattern_len = if description[start..].starts_with("Keywords:") {
+            "Keywords:".len()
+        } else {
+            "Triggers:".len()
+        };
+
+        let keywords_part = &description[start + pattern_len..];
+        // 提取到句子结尾或下一个大写字母开始之前
+        let keywords_end = keywords_part.find(|c: char| c == '.' || c == '\n')
+            .or_else(|| keywords_part.find('"')) // 遇到引号也停止
+            .unwrap_or(keywords_part.len());
+        let keywords_text = &keywords_part[..keywords_end];
+
+        // 按逗号分割，清理每个关键词
+        for keyword in keywords_text.split(',') {
+            let keyword = keyword.trim();
+            if !keyword.is_empty() && keyword.len() <= 30 {
+                // 移除引号
+                let cleaned = keyword.trim_matches('\'').trim_matches('"').trim();
+                if !cleaned.is_empty() {
+                    triggers.push(cleaned.to_string());
+                }
+            }
+        }
+
+        if !triggers.is_empty() {
+            return triggers;
+        }
+    }
+
+    // ========== 模式 3: Use this when / Use when / Use it when / Use this skill any time / You should use this skill when / Claude should use this skill whenever ==========
+    // 这些模式后通常跟着上下文描述，从中提取关键短语
+    let use_pattern_start = description.find("Use this when")
+        .or_else(|| description.find("Use when"))
+        .or_else(|| description.find("You should use this skill when"))
+        .or_else(|| description.find("Use this skill when"))
+        .or_else(|| description.find("Use it when")) // brand-guidelines 格式
+        .or_else(|| description.find("Use this skill any time")) // pptx/xlsx 格式
+        .or_else(|| description.find("Claude should use this skill whenever")); // internal-comms 格式
+
+    if let Some(start) = use_pattern_start {
+        // 查找描述文本的结束位置
+        let use_text = &description[start..];
+
+        // 提取到句子结束或句号
+        let end = use_text.find('.')
+            .or_else(|| use_text.find("DO NOT"))
+            .or_else(|| use_text.find('\n'))
+            .unwrap_or_else(|| {
+                // 按字符边界安全截断
+                use_text
+                    .char_indices()
+                    .nth(200)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(use_text.len())
+            });
+
+        let context_text = &use_text[..end];
+
+        // 提取引号中的短语
+        if let Ok(quote_pattern) = regex::Regex::new(r#""([^"]+)""#) {
+            for cap in quote_pattern.captures_iter(context_text) {
+                if let Some(phrase) = cap.get(1) {
+                    let phrase_str = phrase.as_str().trim();
+                    if !phrase_str.is_empty() && phrase_str.len() <= 40 {
+                        triggers.push(phrase_str.to_string());
+                    }
+                }
+            }
+        }
+
+        // 提取 "or" 连接的关键词列表
+        if triggers.is_empty() {
+            // 匹配 "create a poster, piece of art, design, or other static piece"
+            // 提取其中的关键词
+            let or_pattern = regex::Regex::new(r#"(?i)(?:a|an|the)?\s+([a-z][a-z\s\-]+?)(?:\s+,|\s+or|\s+and|\.)"#)
+                .ok();
+            if let Some(or_pat) = or_pattern {
+                for cap in or_pat.captures_iter(context_text) {
+                    if let Some(phrase) = cap.get(1) {
+                        let phrase_str = phrase.as_str().trim();
+                        if phrase_str.len() >= 3 && phrase_str.len() <= 30 {
+                            triggers.push(phrase_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 如果仍然为空，尝试从整个描述中提取关键词
+        if triggers.is_empty() {
+            // 简单启发式：提取较短的、有意义的词汇
+            let stopwords = ["this", "with", "from", "when", "should", "create", "user", "other", "they", "them", "have", "will", "just", "like", "into", "your"];
+            for word in context_text.split_whitespace() {
+                let word = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-');
+                if word.len() >= 4 && word.len() <= 20 {
+                    // 跳过常见停用词
+                    let lower = word.to_lowercase();
+                    if !stopwords.contains(&lower.as_str()) {
+                        triggers.push(word.to_string());
+                    }
+                }
+            }
+        }
+
+        if !triggers.is_empty() {
+            return triggers;
+        }
+    }
+
+    // ========== 模式 4: Triggers on: (英文内联逗号分隔) ==========
+    // 示例: "Triggers on: unsafe, raw pointer, FFI, extern, ..."
+    if let Some(trigger_start) = description.find("Triggers on:") {
+        let triggers_part = &description[trigger_start + "Triggers on:".len()..];
+
+        // 提取到下一个句号、换行或描述结尾
+        let triggers_end = triggers_part.find(|c: char| c == '.' || c == '\n' || c == '"')
+            .unwrap_or(triggers_part.len());
+
+        let triggers_text = &triggers_part[..triggers_end];
+
+        // 按逗号分割，清理每个触发词
+        for trigger in triggers_text.split(',') {
+            let trigger = trigger.trim();
+            // 移除末尾的引号或其他标点
+            let cleaned = trigger.trim_matches(|c: char| c == '"' || c == '\'' || c == '.')
+                .trim();
+            if !cleaned.is_empty() && cleaned.len() >= 2 && cleaned.len() <= 30 {
+                triggers.push(cleaned.to_string());
+            }
+        }
+
+        if !triggers.is_empty() {
+            return triggers;
+        }
+    }
+
+    // ========== 模式 5: Trigger whenever / Trigger especially when ==========
+    // 示例: "Trigger whenever the user mentions deck, slides, presentation..."
+    //      "Trigger especially when the user references a spreadsheet file..."
+    let trigger_when_start = description.find("Trigger whenever")
+        .or_else(|| description.find("Trigger especially when"));
+
+    if let Some(start) = trigger_when_start {
+        // 跳过 "Trigger whenever" 或 "Trigger especially when"
+        let after_pattern = if description[start..].starts_with("Trigger especially when") {
+            &description[start + "Trigger especially when".len()..]
+        } else {
+            &description[start + "Trigger whenever".len()..]
+        };
+
+        // 提取到下一个句号、换行或引号
+        let trigger_end = after_pattern.find(|c: char| c == '.' || c == '\n' || c == '"')
+            .unwrap_or_else(|| {
+                // 按字符边界安全截断
+                after_pattern
+                    .char_indices()
+                    .nth(300)
+                    .map(|(idx, _)| idx)
+                    .unwrap_or(after_pattern.len())
+            });
+
+        let trigger_text = &after_pattern[..trigger_end];
+
+        // 提取引号中的关键词
+        if let Ok(quote_pattern) = regex::Regex::new(r#""([^"""]+)""#) {
+            for cap in quote_pattern.captures_iter(trigger_text) {
+                if let Some(phrase) = cap.get(1) {
+                    let phrase_str = phrase.as_str().trim();
+                    if phrase_str.len() >= 2 && phrase_str.len() <= 30 {
+                        triggers.push(phrase_str.to_string());
+                    }
+                }
+            }
+        }
+
+        // 提取引号外的关键词（按逗号分隔）
+        if triggers.is_empty() {
+            for keyword in trigger_text.split([',', ';', '和']) {
+                let keyword = keyword.trim()
+                    .trim_matches(|c: char| c == '"' || c == '\'' || c == '.')
+                    .trim();
+                if keyword.len() >= 2 && keyword.len() <= 30 {
+                    triggers.push(keyword.to_string());
+                }
+            }
+        }
+
+        if !triggers.is_empty() {
+            return triggers;
+        }
+    }
+
+    // ========== 模式 6: 必须使用此技能当用户 (中文编号列表) ==========
+    // 示例: "**必须使用此技能**当用户：1) 提到 Tauri、Rust+Web 应用..."
+    let chinese_patterns = [
+        "必须使用此技能当用户",
+        "必须使用此技能**当用户",
+        "**必须使用此技能**当用户",
+    ];
+
+    for pattern in &chinese_patterns {
+        if let Some(trigger_start) = description.find(pattern) {
+            let triggers_part = &description[trigger_start + pattern.len()..];
+
+            // 提取到下一个双换行或 "---" (frontmatter 结束)
+            let triggers_end = triggers_part.find("\n\n")
+                .or_else(|| triggers_part.find("---"))
+                .or_else(|| triggers_part.find('.'))
+                .unwrap_or_else(|| {
+                    // 按字符边界安全截断（避免 UTF-8 多字节字符中间截断）
+                    triggers_part
+                        .char_indices()
+                        .nth(500) // 最多 500 个字符
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(triggers_part.len())
+                });
+
+            let triggers_text = &triggers_part[..triggers_end];
+
+            // 先提取引号中的内容（最高优先级）
+            if let Ok(quote_pattern) = regex::Regex::new(r#""([^"""]+)""#) {
+                for cap in quote_pattern.captures_iter(triggers_text) {
+                    if let Some(phrase) = cap.get(1) {
+                        let phrase_str = phrase.as_str().trim();
+                        if phrase_str.len() >= 2 && phrase_str.len() <= 30 {
+                            triggers.push(phrase_str.to_string());
+                        }
+                    }
+                }
+            }
+
+            // 如果引号提取为空，从编号列表中提取关键词
+            if triggers.is_empty() {
+                // 匹配 "1) 提到 Tauri、Rust+Web 应用、Electron 替换方案"
+                // 提取数字标号后的内容
+                if let Ok(list_pattern) = regex::Regex::new(r#"[\d]+[\)\]]\s+([^。\n]+)"#) {
+                    for cap in list_pattern.captures_iter(triggers_text) {
+                        if let Some(item) = cap.get(1) {
+                            let item_text = item.as_str().trim();
+
+                            // 提取引号中的短语
+                            if let Ok(quote_pattern) = regex::Regex::new(r#""([^"""]+)""#) {
+                                for quote_cap in quote_pattern.captures_iter(item_text) {
+                                    if let Some(phrase) = quote_cap.get(1) {
+                                        let phrase_str = phrase.as_str().trim();
+                                        if phrase_str.len() >= 2 && phrase_str.len() <= 30 {
+                                            triggers.push(phrase_str.to_string());
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 按顿号、逗号分割提取关键词
+                            for keyword in item_text.split(['、', '，', ',']) {
+                                let keyword = keyword.trim()
+                                    .trim_matches(|c: char| c == '"' || c == '\'' || c == '、')
+                                    .trim();
+                                if keyword.len() >= 2 && keyword.len() <= 20 {
+                                    // 跳过常见停用词
+                                    let lower = keyword.to_lowercase();
+                                    if !["提到", "询问", "需要", "遇到", "说", "使用"].contains(&lower.as_str()) {
+                                        triggers.push(keyword.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !triggers.is_empty() {
+                return triggers;
+            }
+        }
+    }
+
+    triggers
 }
 
 /// 计算技能质量分数
@@ -1495,13 +1873,20 @@ pub async fn detect_and_inject_skill(
                 .await;
 
             if should_invoke {
+                // 按字符边界安全截断用户文本
+                let truncated_text = user_text
+                    .char_indices()
+                    .nth(100)
+                    .map(|(idx, _)| &user_text[..idx])
+                    .unwrap_or(&user_text);
+
                 invoker
                     .record_invocation(
                         session_id.unwrap(),
                         &skill.id,
                         &skill.name,
                         skill.confidence,
-                        &user_text[..user_text.len().min(100)],
+                        truncated_text,
                     )
                     .await;
 
@@ -2855,5 +3240,178 @@ mod tests {
         let ctx = extract_context("deploy with Docker and Kubernetes on AWS");
         assert!(ctx.detected_patterns.contains(&"docker".to_string()));
         assert!(ctx.detected_patterns.contains(&"kubernetes".to_string()));
+    }
+
+    #[test]
+    fn test_extract_triggers_from_description_with_backticks() {
+        let desc = "Build apps with the Claude API. TRIGGER when: code imports `anthropic`, user asks to use `claude_agent_sdk`, or mentions `@anthropic-ai/sdk`. DO NOT TRIGGER when: code imports `openai` or general programming.";
+        let triggers = extract_triggers_from_description(desc);
+        assert!(triggers.contains(&"anthropic".to_string()));
+        assert!(triggers.contains(&"claude_agent_sdk".to_string()));
+        assert!(triggers.contains(&"@anthropic-ai/sdk".to_string()));
+        assert!(!triggers.contains(&"openai".to_string()));
+    }
+
+    #[test]
+    fn test_extract_triggers_from_description_with_quotes() {
+        let desc = "TRIGGER when: imports 'anthropic' or \"@anthropic-ai/sdk\". DO NOT TRIGGER when: imports 'openai'.";
+        let triggers = extract_triggers_from_description(desc);
+        assert!(triggers.contains(&"anthropic".to_string()));
+        assert!(triggers.contains(&"@anthropic-ai/sdk".to_string()));
+        assert!(!triggers.contains(&"openai".to_string()));
+    }
+
+    #[test]
+    fn test_extract_triggers_from_description_no_triggers() {
+        let desc = "This is a skill without trigger information. Just some text here.";
+        let triggers = extract_triggers_from_description(desc);
+        assert!(triggers.is_empty());
+    }
+
+    #[test]
+    fn test_extract_triggers_from_description_with_slash_command() {
+        let desc = "TRIGGER when: user mentions commit command or uses git skill. DO NOT TRIGGER when: general programming.";
+        let triggers = extract_triggers_from_description(desc);
+        // Should extract commands like /commit and /git
+        assert!(triggers.iter().any(|t| t.starts_with('/') && (t.contains("commit") || t.contains("git"))));
+    }
+
+    // =========================================================================
+    // 新增：测试 oh-my-claudecode 的其他格式模式
+    // =========================================================================
+
+    #[test]
+    fn test_extract_triggers_from_use_this_when() {
+        // algorithmic-art 格式
+        let desc = "Creating algorithmic art using p5.js. Use this when users request creating art using code, generative art, algorithmic art, flow fields, or particle systems.";
+        let triggers = extract_triggers_from_description(desc);
+        // 应该提取出关键词，即使不在引号中
+        assert!(!triggers.is_empty(), "应该从 'Use this when' 模式中提取触发词");
+        // 可能的触发词: "generative", "art", "algorithmic", "flow", "fields", "particle", "systems"
+    }
+
+    #[test]
+    fn test_extract_triggers_from_keywords_list() {
+        // coding-guidelines 格式
+        let desc = r#"Use when asking about Rust code style or best practices. Keywords: naming, formatting, comment, clippy, rustfmt, lint, code style, best practice, 命名规范, 代码风格"#;
+        let triggers = extract_triggers_from_description(desc);
+        assert!(triggers.contains(&"naming".to_string()));
+        assert!(triggers.contains(&"formatting".to_string()));
+        assert!(triggers.contains(&"clippy".to_string()));
+        assert!(triggers.contains(&"rustfmt".to_string()));
+        assert!(triggers.contains(&"命名规范".to_string()));
+        assert!(triggers.contains(&"代码风格".to_string()));
+    }
+
+    #[test]
+    fn test_extract_triggers_from_you_should_use() {
+        // canvas-design 格式
+        let desc = "Create beautiful visual art in .png and .pdf documents. You should use this skill when the user asks to create a poster, piece of art, design, or other static piece.";
+        let triggers = extract_triggers_from_description(desc);
+        assert!(!triggers.is_empty(), "应该从 'You should use this skill when' 模式中提取触发词");
+    }
+
+    #[test]
+    fn test_extract_triggers_algorithmic_art_real() {
+        // 真实的 algorithmic-art 技能 description
+        let desc = "Creating algorithmic art using p5.js with seeded randomness and interactive parameter exploration. Use this when users request creating art using code, generative art, algorithmic art, flow fields, or particle systems. Create original algorithmic art rather than copying existing artists' work to avoid copyright violations.";
+        let triggers = extract_triggers_from_description(desc);
+        assert!(!triggers.is_empty(), "algorithmic-art 应该有触发词");
+        // 验证包含关键短语
+        let combined = triggers.join(" ").to_lowercase();
+        assert!(combined.contains("art") || combined.contains("algorithmic"));
+    }
+
+    #[test]
+    fn test_extract_triggers_canvas_design_real() {
+        // 真实的 canvas-design 技能 description
+        let desc = "Create beautiful visual art in .png and .pdf documents using design philosophy. You should use this skill when the user asks to create a poster, piece of art, design, or other static piece. Create original visual designs, never copying existing artists' work to avoid copyright violations.";
+        let triggers = extract_triggers_from_description(desc);
+        assert!(!triggers.is_empty(), "canvas-design 应该有触发词");
+    }
+
+    #[test]
+    fn test_extract_triggers_brand_guidelines_real() {
+        // brand-guidelines 技能 - 没有 "Use this when" 或 "Keywords:" 模式
+        let desc = "Applies Anthropic's official brand colors and typography to any sort of artifact that may benefit from having Anthropic's look and feel. Use when brand colors or style guidelines, visual formatting, or company design standards apply.";
+        let triggers = extract_triggers_from_description(desc);
+        // 应该从 "Use when" 中提取一些触发词
+        assert!(!triggers.is_empty(), "brand-guidelines 应该有触发词");
+    }
+
+    #[test]
+    fn test_extract_triggers_with_or_list() {
+        // 测试提取 "or" 连接的列表
+        let desc = "Use this skill when the user asks to create a poster, piece of art, design, or other static piece.";
+        let triggers = extract_triggers_from_description(desc);
+        assert!(!triggers.is_empty());
+        // 应该提取到 poster, art, design 等关键词
+        let combined = triggers.join(" ").to_lowercase();
+        assert!(combined.contains("poster") || combined.contains("art") || combined.contains("design"));
+    }
+
+    #[test]
+    fn test_extract_triggers_claude_api_real() {
+        // 验证 claude-api 仍然能正确解析（它有 TRIGGER when 格式）
+        let desc = r#"Build apps with the Claude API or Anthropic SDK. TRIGGER when: code imports `anthropic`/`@anthropic-ai/sdk`/`claude_agent_sdk`, or user asks to use Claude API, Anthropic SDKs, or Agent SDK. DO NOT TRIGGER when: code imports `openai`/other AI SDK, general programming, or ML/data-science tasks."#;
+        let triggers = extract_triggers_from_description(desc);
+        assert!(triggers.contains(&"anthropic".to_string()));
+        assert!(triggers.contains(&"@anthropic-ai/sdk".to_string()));
+        assert!(triggers.contains(&"claude_agent_sdk".to_string()));
+        assert!(!triggers.contains(&"openai".to_string()));
+    }
+
+    // =========================================================================
+    // 新增：测试 Triggers on: 和中文格式模式
+    // =========================================================================
+
+    #[test]
+    fn test_extract_triggers_from_triggers_on() {
+        // unsafe-checker 格式 - "Triggers on:" 逗号分隔列表
+        let desc = r#"CRITICAL: Use for unsafe Rust code review and FFI. Triggers on: unsafe, raw pointer, FFI, extern, transmute, *mut, *const, union, #[repr(C)], libc, std::ffi, MaybeUninit, NonNull, SAFETY comment, soundness, undefined behavior, UB"#;
+        let triggers = extract_triggers_from_description(desc);
+        assert!(!triggers.is_empty(), "应该从 'Triggers on:' 模式中提取触发词");
+        assert!(triggers.contains(&"unsafe".to_string()));
+        assert!(triggers.contains(&"raw pointer".to_string()));
+        assert!(triggers.contains(&"FFI".to_string()));
+        assert!(triggers.contains(&"extern".to_string()));
+        assert!(triggers.contains(&"transmute".to_string()));
+        assert!(triggers.contains(&"*mut".to_string()));
+        assert!(triggers.contains(&"*const".to_string()));
+        assert!(triggers.contains(&"union".to_string()));
+    }
+
+    #[test]
+    fn test_extract_triggers_from_chinese_format() {
+        // tauri-dev 格式 - 中文 "必须使用此技能当用户：" 格式
+        let desc = r#"Tauri 应用开发助手 - 全面支持 Tauri 桌面应用的开发、配置、打包和调试。**必须使用此技能**当用户：1) 提到 Tauri、Rust+Web 应用、Electron 替换方案 2) 说"创建桌面应用"、"跨平台应用"、"小型应用" 3) 需要"文件系统访问"、"系统菜单"、"托盘图标"、"原生对话框"等系统功能"#;
+        let triggers = extract_triggers_from_description(desc);
+        assert!(!triggers.is_empty(), "应该从中文格式中提取触发词");
+        // 验证提取的触发词包含引号中的内容
+        let combined = triggers.join(" ");
+        assert!(combined.contains("Tauri") || combined.contains("创建桌面应用"));
+        assert!(combined.contains("Rust+Web") || combined.contains("跨平台应用"));
+    }
+
+    #[test]
+    fn test_extract_triggers_godot_dev_real() {
+        // 真实的 godot-dev 技能 description（简化版）
+        let desc = r#"Godot Engine 开发助手 - 全面支持 Godot 游戏的开发、配置、打包和调试。**必须使用此技能**当用户：1) 提到 Godot、Godot Engine、GDScript、2D/3D 游戏 2) 说"创建游戏"、"做 2D 游戏"、"做 3D 游戏" 3) 需要"游戏物理"、"AI 导航"、"网络多人"、"粒子系统"等游戏功能"#;
+        let triggers = extract_triggers_from_description(desc);
+        assert!(!triggers.is_empty(), "godot-dev 应该有触发词");
+        // 应该包含 Godot 相关关键词
+        let combined = triggers.join(" ").to_lowercase();
+        assert!(combined.contains("godot"));
+    }
+
+    #[test]
+    fn test_extract_triggers_sea_orm_dev_real() {
+        // 真实的 sea-orm-dev 技能 description（简化版）
+        let desc = r#"SeaORM Rust async ORM 开发助手。**必须使用此技能**当用户：1) 提到 SeaORM、SeaQL、Rust ORM、async ORM 2) 询问 Rust 数据库操作、实体定义、ActiveModel 3) 需要编写数据库迁移、实体关系、查询"#;
+        let triggers = extract_triggers_from_description(desc);
+        assert!(!triggers.is_empty(), "sea-orm-dev 应该有触发词");
+        // 应该包含 SeaORM 相关关键词
+        let combined = triggers.join(" ").to_lowercase();
+        assert!(combined.contains("seaorm") || combined.contains("seaql"));
     }
 }

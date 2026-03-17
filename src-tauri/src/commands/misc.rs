@@ -1,4 +1,5 @@
 #![allow(non_snake_case)]
+#![allow(dead_code)] // Platform-specific code and tool version detection functions are conditionally used
 
 use crate::app_config::AppType;
 use crate::init_status::{InitErrorPayload, SkillsMigrationPayload};
