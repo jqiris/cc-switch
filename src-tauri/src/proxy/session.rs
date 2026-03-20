@@ -309,8 +309,27 @@ fn extract_codex_session(headers: &HeaderMap, body: &serde_json::Value) -> Optio
 fn extract_from_metadata(body: &serde_json::Value) -> Option<SessionIdResult> {
     let metadata = body.get("metadata")?;
 
-    // 1. 从 metadata.user_id 提取（格式: user_xxx_session_yyy）
+    // 1. 从 metadata.user_id 提取
     if let Some(user_id) = metadata.get("user_id").and_then(|v| v.as_str()) {
+        // 1a. 尝试解析为 JSON 格式（VS Code 扩展格式）
+        // 格式: {"device_id":"...", "account_uuid":"", "session_id":"..."}
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(user_id) {
+            if let Some(session_id) = parsed.get("session_id").and_then(|v| v.as_str()) {
+                if !session_id.is_empty() {
+                    log::info!(
+                        "[Session] 从 user_id JSON 中提取 session_id: {}",
+                        session_id
+                    );
+                    return Some(SessionIdResult {
+                        session_id: session_id.to_string(),
+                        source: SessionIdSource::MetadataUserId,
+                        client_provided: true,
+                    });
+                }
+            }
+        }
+
+        // 1b. 尝试解析旧格式（CLI 格式: user_xxx_session_yyy）
         if let Some(session_id) = parse_session_from_user_id(user_id) {
             return Some(SessionIdResult {
                 session_id,
@@ -478,6 +497,25 @@ mod tests {
     }
 
     // ========== Session ID 提取测试 ==========
+
+    #[test]
+    fn test_extract_session_from_claude_vscode_user_id_json() {
+        // VS Code 扩展格式: user_id 是一个 JSON 字符串
+        let headers = HeaderMap::new();
+        let body = json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "metadata": {
+                "user_id": r#"{"device_id":"5b79f5e79e85c7702c3b6934bbfb75c0b5418ba00b89325cdf5f9b28a40b0ad4","account_uuid":"","session_id":"2913106c-18e1-4c1f-8900-61bcd1119110"}"#
+            }
+        });
+
+        let result = extract_session_id(&headers, &body, "claude");
+
+        assert_eq!(result.session_id, "2913106c-18e1-4c1f-8900-61bcd1119110");
+        assert_eq!(result.source, SessionIdSource::MetadataUserId);
+        assert!(result.client_provided);
+    }
 
     #[test]
     fn test_extract_session_from_claude_metadata_user_id() {

@@ -112,6 +112,18 @@ impl RequestContext {
             .unwrap_or("unknown")
             .to_string();
 
+        // 调试：打印请求中的 metadata 和所有 headers（需要时取消注释）
+        // log::info!(
+        //     "[{}] 请求 metadata: {:?}",
+        //     tag,
+        //     body.get("metadata")
+        // );
+        // log::info!(
+        //     "[{}] 请求 headers: {:?}",
+        //     tag,
+        //     headers.iter().map(|(k, v)| (k.as_str(), v.to_str().unwrap_or("?"))).collect::<Vec<_>>()
+        // );
+
         // 提取 Session ID
         let session_result = extract_session_id(headers, body, app_type_str);
         let session_id = session_result.session_id.clone();
