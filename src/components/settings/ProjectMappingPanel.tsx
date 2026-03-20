@@ -11,6 +11,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   FolderTree,
+  FolderOpen,
   Plus,
   Trash2,
   Loader2,
@@ -27,6 +28,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { settingsApi } from "@/lib/api/settings";
 import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -342,30 +344,47 @@ export function ProjectMappingPanel({
                 <Label htmlFor="projectPath" className="text-sm font-medium">
                   {t("projectMapping.projectPath", "项目路径")}
                 </Label>
-                <div className="relative">
-                  <FolderTree className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-                  <Input
-                    id="projectPath"
-                    value={formData.projectPath}
-                    onChange={(e) =>
-                      setFormData({ ...formData, projectPath: e.target.value })
-                    }
-                    placeholder={t(
-                      "projectMapping.projectPathPlaceholder",
-                      "/path/to/project 或 /home/user/projects/*",
-                    )}
-                    className={cn(
-                      "pl-10 transition-colors",
-                      formData.projectPath.trim() &&
-                        "border-emerald-500/50 focus-visible:border-emerald-500",
-                    )}
-                  />
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <FolderTree className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                    <Input
+                      id="projectPath"
+                      value={formData.projectPath}
+                      readOnly
+                      placeholder={t(
+                        "projectMapping.projectPathPlaceholder",
+                        "点击右侧按钮选择项目目录",
+                      )}
+                      className={cn(
+                        "pl-10 pr-3 cursor-default bg-muted/30",
+                        formData.projectPath.trim() &&
+                          "border-emerald-500/50 focus-visible:border-emerald-500",
+                      )}
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="gap-1.5 shrink-0"
+                    onClick={async () => {
+                      const selected = await settingsApi.selectConfigDirectory(
+                        formData.projectPath || undefined,
+                      );
+                      if (selected) {
+                        setFormData({ ...formData, projectPath: selected });
+                      }
+                    }}
+                  >
+                    <FolderOpen className="h-4 w-4" />
+                    {t("projectMapping.selectDir", "选择目录")}
+                  </Button>
                 </div>
                 <p className="text-xs text-muted-foreground flex items-center gap-1">
                   <Info className="h-3 w-3" />
                   {t(
                     "projectMapping.projectPathHint",
-                    "支持精确路径或 glob 模式（如 /home/user/projects/*）",
+                    "通过目录选择器选取项目根目录，避免手动输入导致路径格式错误",
                   )}
                 </p>
               </div>
