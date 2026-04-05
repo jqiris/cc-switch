@@ -1825,6 +1825,8 @@ pub async fn detect_and_inject_skill(
     body: serde_json::Value,
     app_type: &str,
     session_id: Option<&str>,
+    injection_mode: super::skill_compressor::SkillInjectionMode,
+    budget_config: &super::skill_compressor::SkillBudgetConfig,
 ) -> (serde_json::Value, Vec<TriggeredSkill>) {
     log::debug!("[SkillTrigger] === 开始技能检测流程 ===");
     log::debug!("[SkillTrigger] 应用类型: {}, 会话ID: {:?}", app_type, session_id);
@@ -1902,27 +1904,100 @@ pub async fn detect_and_inject_skill(
         normal_skills.push(skill);
     }
 
-    // 注入普通技能（标准格式）
-    let body = if !normal_skills.is_empty() {
-        inject_skills_content(body, &normal_skills)
-    } else {
-        body
-    };
+    // 根据注入模式决定策略
+    let body = match injection_mode {
+        super::skill_compressor::SkillInjectionMode::None => {
+            log::info!(
+                "[SkillTrigger] Skill 注入已禁用（None 模式），跳过 {} 个触发技能",
+                auto_invoke_skills.len() + normal_skills.len()
+            );
+            body
+        }
+        super::skill_compressor::SkillInjectionMode::Catalog => {
+            // Catalog 模式：使用预算分配，只注入少量完整 skill + 其余降级为 catalog
+            log::info!(
+                "[SkillTrigger] 使用 Catalog 模式: {} 自动调用, {} 普通触发",
+                auto_invoke_skills.len(),
+                normal_skills.len()
+            );
 
-    // 注入自动调用技能（强势格式，追加在 system 末尾）
-    let body = if !auto_invoke_skills.is_empty() {
-        inject_auto_invoke_skills(body, &auto_invoke_skills)
-    } else {
-        body
+            // auto_invoke skills 始终完整注入（高置信度 >= 80%）
+            let mut body = if !auto_invoke_skills.is_empty() {
+                inject_auto_invoke_skills(body, &auto_invoke_skills)
+            } else {
+                body
+            };
+
+            // normal skills 使用预算分配
+            if !normal_skills.is_empty() {
+                let skill_tuples: Vec<(String, String, String, usize)> = normal_skills
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.name.clone(),
+                            s.content.clone(),
+                            s.matched_trigger.clone(),
+                            s.confidence,
+                        )
+                    })
+                    .collect();
+
+                let allocation =
+                    super::skill_compressor::allocate_budget(&skill_tuples, budget_config);
+
+                log::info!(
+                    "[SkillTrigger] Catalog 分配: {} 完整注入, {} catalog 降级, 总计 {} 字符 (约 {} tokens)",
+                    allocation.full_skills.len(),
+                    allocation.catalog_skills.len(),
+                    allocation.total_chars,
+                    allocation.estimated_tokens,
+                );
+
+                // 获取 scope（取第一个 skill 的 scope）
+                let scope_str = normal_skills
+                    .first()
+                    .map(|s| match s.scope {
+                        SkillScope::User => "用户",
+                        SkillScope::Project => "项目",
+                        SkillScope::Global => "全局",
+                    })
+                    .unwrap_or("用户");
+
+                body = super::skill_compressor::inject_with_budget(
+                    body, &allocation, scope_str,
+                );
+            }
+
+            body
+        }
+        super::skill_compressor::SkillInjectionMode::Full => {
+            // Full 模式：保持原有行为，注入所有 skill 的完整内容
+            // 注入普通技能（标准格式）
+            let body = if !normal_skills.is_empty() {
+                inject_skills_content(body, &normal_skills)
+            } else {
+                body
+            };
+
+            // 注入自动调用技能（强势格式，追加在 system 末尾）
+            let body = if !auto_invoke_skills.is_empty() {
+                inject_auto_invoke_skills(body, &auto_invoke_skills)
+            } else {
+                body
+            };
+
+            body
+        }
     };
 
     // 统计日志
     let total = auto_invoke_skills.len() + normal_skills.len();
     log::info!(
-        "[SkillTrigger] ✓✓✓ 触发 {} 个技能: {} 自动调用, {} 普通注入 ✓✓✓",
+        "[SkillTrigger] ✓✓✓ 触发 {} 个技能: {} 自动调用, {} 普通注入 (模式: {}) ✓✓✓",
         total,
         auto_invoke_skills.len(),
-        normal_skills.len()
+        normal_skills.len(),
+        injection_mode,
     );
 
     if let Some(sid) = session_id {

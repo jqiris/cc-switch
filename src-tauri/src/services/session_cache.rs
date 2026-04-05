@@ -83,6 +83,12 @@ impl SessionCache {
             );
             return Some(meta.cwd.clone());
         }
+        drop(cache);
+
+        // 兜底：定向查找该 session 文件（解决 scan 在文件写入早期扫过导致的竞态）
+        if let Some(cwd) = self.find_session_file_direct(session_id).await {
+            return Some(cwd);
+        }
 
         // 打印一些可用的 session_id 供调试
         let cache = self.cache.read().await;
@@ -162,6 +168,58 @@ impl SessionCache {
         );
     }
 
+    /// 直接通过 glob 查找指定 session_id 的文件并解析 cwd
+    ///
+    /// 作为 get_cwd 的最终兜底：当 bulk scan 在 session 文件尚未写完 cwd 时
+    /// 扫过，TTL 内不会再扫，因此需要定向查找该 session 文件。
+    async fn find_session_file_direct(&self, session_id: &str) -> Option<String> {
+        let projects_dir = get_claude_config_dir().join("projects");
+        if !projects_dir.exists() {
+            return None;
+        }
+
+        let pattern = projects_dir.join("*").join(format!("{}.jsonl", session_id));
+        let pattern_str = pattern.to_string_lossy();
+
+        log::debug!(
+            "[SessionCache] 定向查找 session 文件: pattern={}",
+            pattern_str
+        );
+
+        let paths: Vec<_> = glob::glob(&pattern_str)
+            .ok()?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        for path in paths {
+            if let Some((sid, cwd)) = parse_session_file(&path) {
+                if sid == session_id {
+                    log::info!(
+                        "[SessionCache] 定向查找成功: session_id={}, cwd={}",
+                        session_id,
+                        cwd
+                    );
+                    // 写入缓存以便后续命中
+                    let mut cache = self.cache.write().await;
+                    cache.insert(
+                        sid.clone(),
+                        SessionMeta {
+                            cwd: cwd.clone(),
+                            updated_at: Instant::now(),
+                        },
+                    );
+                    return Some(cwd);
+                }
+            }
+        }
+
+        log::debug!(
+            "[SessionCache] 定向查找未找到: session_id={}",
+            session_id
+        );
+        None
+    }
+
     /// 获取缓存大小
     pub async fn size(&self) -> usize {
         self.cache.read().await.len()
@@ -179,8 +237,8 @@ fn parse_session_file(path: &std::path::Path) -> Option<(String, String)> {
     let file = File::open(path).ok()?;
     let reader = BufReader::new(file);
 
-    // 只读取前几行（通常元数据在第一行）
-    for line in reader.lines().take(5) {
+    // 读取前 20 行（较新版本的 Claude Code 中 cwd 可能出现在第 3 行之后）
+    for line in reader.lines().take(20) {
         let line = line.ok()?;
         let value: serde_json::Value = serde_json::from_str(&line).ok()?;
 

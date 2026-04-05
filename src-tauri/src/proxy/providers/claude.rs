@@ -678,4 +678,211 @@ mod tests {
         );
         assert!(!adapter.needs_transform(&unknown_format));
     }
+
+    #[test]
+    fn test_local_model_provider_with_openai_chat_format() {
+        // 模拟用户的本地模型配置
+        let adapter = ClaudeAdapter::new();
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8168",
+                    "ANTHROPIC_AUTH_TOKEN": "xxxx",
+                    "ANTHROPIC_MODEL": "qwen2.5-coder-32b-instruct-q4_k_m",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen2.5-coder-32b-instruct-q4_k_m",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen2.5-coder-32b-instruct-q4_k_m",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "qwen2.5-coder-32b-instruct-q4_k_m"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // 验证 base_url 提取
+        let base_url = adapter.extract_base_url(&provider).unwrap();
+        assert_eq!(base_url, "http://127.0.0.1:8168");
+
+        // 验证认证提取
+        let auth = adapter.extract_auth(&provider).unwrap();
+        assert_eq!(auth.api_key, "xxxx");
+        assert_eq!(auth.strategy, AuthStrategy::Anthropic);
+
+        // 验证需要格式转换
+        assert!(adapter.needs_transform(&provider));
+
+        // 验证 URL 构建（/v1/chat/completions 不应添加 ?beta=true）
+        let url = adapter.build_url("http://127.0.0.1:8168", "/v1/chat/completions");
+        assert_eq!(url, "http://127.0.0.1:8168/v1/chat/completions");
+    }
+
+    #[test]
+    fn test_transform_anthropic_request_to_openai_for_local_model() {
+        // 测试请求转换：Anthropic → OpenAI
+        let anthropic_request = json!({
+            "model": "qwen2.5-coder-32b-instruct-q4_k_m",
+            "max_tokens": 100,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Hello, how are you?"
+                }
+            ],
+            "stream": false
+        });
+
+        let openai_request = super::super::transform::anthropic_to_openai(
+            anthropic_request,
+            Some("test-provider"),
+        )
+        .unwrap();
+
+        // 验证转换结果
+        assert_eq!(openai_request["model"], "qwen2.5-coder-32b-instruct-q4_k_m");
+        assert_eq!(openai_request["max_tokens"], 100);
+        assert_eq!(openai_request["messages"][0]["role"], "user");
+        assert_eq!(openai_request["messages"][0]["content"], "Hello, how are you?");
+        assert_eq!(openai_request["stream"], false);
+        assert_eq!(openai_request["prompt_cache_key"], "test-provider");
+    }
+
+    #[test]
+    fn test_transform_openai_response_to_anthropic_for_local_model() {
+        // 测试响应转换：OpenAI → Anthropic
+        let openai_response = json!({
+            "id": "chatcmpl-test123",
+            "model": "qwen2.5-coder-32b-instruct-q4_k_m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello! I'm doing well, thank you for asking!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 10,
+                "total_tokens": 40,
+                "prompt_tokens_details": {
+                    "cached_tokens": 24
+                }
+            }
+        });
+
+        let anthropic_response =
+            super::super::transform::openai_to_anthropic(openai_response).unwrap();
+
+        // 验证转换结果
+        assert_eq!(anthropic_response["id"], "chatcmpl-test123");
+        assert_eq!(anthropic_response["type"], "message");
+        assert_eq!(anthropic_response["role"], "assistant");
+        assert_eq!(anthropic_response["model"], "qwen2.5-coder-32b-instruct-q4_k_m");
+
+        // 验证 content
+        let content = anthropic_response["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[0]["text"],
+            "Hello! I'm doing well, thank you for asking!"
+        );
+
+        // 验证 stop_reason
+        assert_eq!(anthropic_response["stop_reason"], "end_turn");
+
+        // 验证 usage（包括 cache tokens）
+        assert_eq!(anthropic_response["usage"]["input_tokens"], 30);
+        assert_eq!(anthropic_response["usage"]["output_tokens"], 10);
+        assert_eq!(anthropic_response["usage"]["cache_read_input_tokens"], 24);
+    }
+
+    #[test]
+    fn test_transform_openai_response_with_tool_calls() {
+        // 测试工具调用响应转换
+        let openai_response = json!({
+            "id": "chatcmpl-tool123",
+            "model": "qwen2.5-coder-32b-instruct-q4_k_m",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"location\": \"Tokyo\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 50,
+                "completion_tokens": 20
+            }
+        });
+
+        let anthropic_response =
+            super::super::transform::openai_to_anthropic(openai_response).unwrap();
+
+        // 验证工具调用转换
+        let content = anthropic_response["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "call_abc123");
+        assert_eq!(content[0]["name"], "get_weather");
+        assert_eq!(content[0]["input"]["location"], "Tokyo");
+        assert_eq!(anthropic_response["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn test_local_model_provider_with_custom_models() {
+        // 测试不同模型配置
+        let adapter = ClaudeAdapter::new();
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8168",
+                    "ANTHROPIC_AUTH_TOKEN": "test-key",
+                    "ANTHROPIC_MODEL": "main-model",
+                    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "haiku-model",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-model",
+                    "ANTHROPIC_DEFAULT_OPUS_MODEL": "opus-model"
+                }
+            }),
+            ProviderMeta {
+                api_format: Some("openai_chat".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // 验证配置正确提取
+        let base_url = adapter.extract_base_url(&provider).unwrap();
+        assert_eq!(base_url, "http://127.0.0.1:8168");
+
+        let auth = adapter.extract_auth(&provider).unwrap();
+        assert_eq!(auth.api_key, "test-key");
+    }
+
+    #[test]
+    fn test_endpoint_mapping_for_openai_chat_format() {
+        // 测试端点映射逻辑
+        // 当 apiFormat="openai_chat" 时，forwarder 会将 /v1/messages 映射到 /v1/chat/completions
+        // 这里测试 build_url 不会添加 ?beta=true 到 /v1/chat/completions
+
+        let adapter = ClaudeAdapter::new();
+
+        // /v1/chat/completions 不应添加 ?beta=true
+        let url_chat = adapter.build_url("http://127.0.0.1:8168", "/v1/chat/completions");
+        assert_eq!(url_chat, "http://127.0.0.1:8168/v1/chat/completions");
+        assert!(!url_chat.contains("?beta=true"));
+
+        // /v1/messages 应该添加 ?beta=true（如果直接使用）
+        let url_messages = adapter.build_url("http://127.0.0.1:8168", "/v1/messages");
+        assert_eq!(url_messages, "http://127.0.0.1:8168/v1/messages?beta=true");
+    }
 }

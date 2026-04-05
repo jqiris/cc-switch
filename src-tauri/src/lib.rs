@@ -20,7 +20,7 @@ mod prompt;
 mod prompt_files;
 mod provider;
 mod provider_defaults;
-mod proxy;
+pub mod proxy;
 mod services;
 mod session_manager;
 mod settings;
@@ -1507,3 +1507,7 @@ fn show_database_init_error_dialog(
         ))
         .blocking_show()
 }
+
+
+#[cfg(test)]
+mod local_model_test;

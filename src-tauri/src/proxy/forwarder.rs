@@ -108,6 +108,74 @@ pub struct RequestForwarder {
     is_project_mapped_provider: bool,
 }
 
+/// Strip Anthropic-specific fields from an OpenAI-compatible request body.
+///
+/// These fields (`prompt_cache_key`, `cache_control`) are not part of the
+/// standard OpenAI Chat Completions API and may cause local models
+/// (llama.cpp, ollama, etc.) to return errors (e.g., 502 with empty body).
+///
+/// Safe to call for ALL openai_chat/openai_responses requests because:
+/// - OpenRouter now uses the native Anthropic endpoint (transparent mode)
+/// - Only local models and generic OpenAI-compatible endpoints use openai_chat
+fn strip_anthropic_fields(mut body: Value) -> Value {
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("prompt_cache_key");
+    }
+    strip_cache_control_recursive(&mut body);
+    body
+}
+
+/// Recursively remove `cache_control` from all nested JSON objects.
+fn strip_cache_control_recursive(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("cache_control");
+            for v in map.values_mut() {
+                strip_cache_control_recursive(v);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                strip_cache_control_recursive(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 对本地模型的消息历史进行裁剪
+///
+/// 当对话历史总字符数超过 max_chars 时，从最旧的消息开始移除。
+/// 始终保留至少 2 条消息（系统 + 最新用户消息）。
+fn trim_messages(mut body: serde_json::Value, max_chars: usize) -> serde_json::Value {
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        let total_chars: usize = messages
+            .iter()
+            .map(|m| serde_json::to_string(m).unwrap_or_default().len())
+            .sum();
+
+        if total_chars > max_chars {
+            let original_count = messages.len();
+            let mut remaining = total_chars;
+            while remaining > max_chars && messages.len() > 2 {
+                if let Some(oldest) = messages.first() {
+                    let size = serde_json::to_string(oldest).unwrap_or_default().len();
+                    remaining -= size;
+                    messages.remove(0);
+                }
+            }
+            log::info!(
+                "[LocalModel] Messages 裁剪: {} → {} 条 ({} → {} 字符)",
+                original_count,
+                messages.len(),
+                total_chars,
+                remaining
+            );
+        }
+    }
+    body
+}
+
 impl RequestForwarder {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -821,9 +889,35 @@ impl RequestForwarder {
 
         // === 技能触发检测 ===
         // 检测用户消息中的触发关键词，自动注入已安装的技能内容
-        // 详细日志由 skill_trigger 模块内部打印
+        // 根据 Provider 类型自动选择注入模式：
+        // - 云端模型 (anthropic): Full 模式，注入完整 skill 内容
+        // - 本地模型 (openai_chat/openai_responses): Catalog 模式，只注入摘要
+        // 可通过 SkillBudgetConfig.provider_overrides 覆盖
+        let is_openai_compatible = if adapter.name() == "Claude" {
+            let api_format = super::providers::get_claude_api_format(provider);
+            api_format == "openai_chat" || api_format == "openai_responses"
+        } else {
+            false
+        };
+
+        let budget_config = super::skill_compressor::SkillBudgetConfig::default();
+        let injection_mode = super::skill_compressor::resolve_injection_mode(
+            &provider.id,
+            provider.meta.as_ref().and_then(|m| m.api_format.as_deref()),
+            adapter.name(),
+            is_openai_compatible,
+            &budget_config,
+        );
+
         let (body_with_skills, triggered_skills) =
-            super::skill_trigger::detect_and_inject_skill(body.clone(), app_type_str, None).await;
+            super::skill_trigger::detect_and_inject_skill(
+                body.clone(),
+                app_type_str,
+                None,
+                injection_mode,
+                &budget_config,
+            )
+            .await;
 
         // 技能触发结果已在 detect_and_inject_skill 内部打印，这里仅做记录
         let _ = triggered_skills; // 避免未使用变量警告
@@ -837,7 +931,10 @@ impl RequestForwarder {
 
         // 转换请求体（如果需要）
         let request_body = if needs_transform {
-            adapter.transform_request(mapped_body, provider)?
+            let transformed = adapter.transform_request(mapped_body, provider)?;
+            // 清理 Anthropic 特有字段（prompt_cache_key, cache_control）
+            // 这些字段不是标准 OpenAI API 的一部分，本地模型可能不识别
+            strip_anthropic_fields(transformed)
         } else {
             mapped_body
         };
@@ -845,6 +942,85 @@ impl RequestForwarder {
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
         // 默认使用空白名单，过滤所有 _ 前缀字段
         let filtered_body = filter_private_params_with_whitelist(request_body, &[]);
+
+        // 对本地模型压缩请求体（无损方案：摘要 + 全量缓存）
+        let filtered_body = if is_openai_compatible {
+            let original_size = serde_json::to_string(&filtered_body).unwrap_or_default().len();
+
+            let mut trimmed = filtered_body;
+
+            // 1. 工具压缩：核心工具完整保留，其余降级为 catalog 索引
+            if let Some(tools) = trimmed.get("tools").and_then(|t| t.as_array()) {
+                if !tools.is_empty() {
+                    let cache_dir = super::skill_compressor::get_tool_cache_dir();
+
+                    // 保存完整工具定义到缓存文件（rtk Tee 恢复机制）
+                    if let Err(e) = super::skill_compressor::save_tool_cache(tools, &cache_dir) {
+                        log::warn!("[LocalModel] 保存工具缓存失败: {}", e);
+                    }
+
+                    // 执行无损压缩
+                    let result = super::skill_compressor::compress_tool_definitions(tools);
+
+                    // 替换 tools 数组为核心工具
+                    if let Some(tools_arr) = trimmed.get_mut("tools") {
+                        *tools_arr = serde_json::json!(result.compressed_tools);
+                    }
+
+                    // 注入 catalog 索引到 system prompt
+                    let catalog_block = super::skill_compressor::format_tool_catalog_block(
+                        &result.catalog_by_provider,
+                        &cache_dir,
+                    );
+                    if !catalog_block.is_empty() {
+                        if let Some(system) = trimmed.get_mut("system") {
+                            if let Some(system_str) = system.as_str() {
+                                *system =
+                                    serde_json::json!(format!("{}\n\n{}", system_str, catalog_block));
+                            } else if let Some(system_arr) = system.as_array_mut() {
+                                system_arr.push(serde_json::json!({
+                                    "type": "text",
+                                    "text": catalog_block
+                                }));
+                            }
+                        } else {
+                            trimmed["system"] = serde_json::json!(catalog_block);
+                        }
+                    }
+
+                    let catalog_bytes = catalog_block.len();
+                    log::info!(
+                        "[LocalModel] 工具无损压缩: {} → {} 完整 + {} 索引 ({} → {} 字符, 节省 {:.0}%)",
+                        result.stats.original_count,
+                        result.stats.core_count,
+                        result.stats.catalog_count,
+                        result.stats.original_bytes,
+                        result.stats.compressed_bytes + catalog_bytes,
+                        if result.stats.original_bytes > 0 {
+                            (1.0 - (result.stats.compressed_bytes + catalog_bytes) as f64
+                                / result.stats.original_bytes as f64)
+                                * 100.0
+                        } else {
+                            0.0
+                        }
+                    );
+                }
+            }
+
+            // 2. Messages 裁剪
+            trimmed = trim_messages(trimmed, 25_000);
+
+            let trimmed_size = serde_json::to_string(&trimmed).unwrap_or_default().len();
+            log::info!(
+                "[LocalModel] 请求体总大小: {} → {} 字符 (节省 {:.0}%)",
+                original_size,
+                trimmed_size,
+                (1.0 - trimmed_size as f64 / original_size as f64) * 100.0
+            );
+            trimmed
+        } else {
+            filtered_body
+        };
 
         // 获取 HTTP 客户端：优先使用供应商单独代理配置，否则使用全局客户端
         let proxy_config = provider.meta.as_ref().and_then(|m| m.proxy_config.as_ref());
@@ -869,28 +1045,36 @@ impl RequestForwarder {
             request = request.header(key, value);
         }
 
-        // 处理 anthropic-beta Header（仅 Claude）
+        // 处理 anthropic-beta Header（仅 Claude 原生格式）
         // 关键：确保包含 claude-code-20250219 标记，这是上游服务验证请求来源的依据
         // 如果客户端发送的 beta 标记中没有包含 claude-code-20250219，需要补充
+        //
+        // 注意：当 apiFormat="openai_chat" 或 "openai_responses" 时，不添加此 header
+        // 因为目标服务可能不认识 Anthropic 特定的 headers
         if adapter.name() == "Claude" {
-            const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
-            let beta_value = if let Some(beta) = headers.get("anthropic-beta") {
-                if let Ok(beta_str) = beta.to_str() {
-                    // 检查是否已包含 claude-code-20250219
-                    if beta_str.contains(CLAUDE_CODE_BETA) {
-                        beta_str.to_string()
+            let api_format = super::providers::get_claude_api_format(provider);
+            let is_openai_compatible = api_format == "openai_chat" || api_format == "openai_responses";
+
+            if !is_openai_compatible {
+                const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+                let beta_value = if let Some(beta) = headers.get("anthropic-beta") {
+                    if let Ok(beta_str) = beta.to_str() {
+                        // 检查是否已包含 claude-code-20250219
+                        if beta_str.contains(CLAUDE_CODE_BETA) {
+                            beta_str.to_string()
+                        } else {
+                            // 补充 claude-code-20250219
+                            format!("{CLAUDE_CODE_BETA},{beta_str}")
+                        }
                     } else {
-                        // 补充 claude-code-20250219
-                        format!("{CLAUDE_CODE_BETA},{beta_str}")
+                        CLAUDE_CODE_BETA.to_string()
                     }
                 } else {
+                    // 如果客户端没有发送，使用默认值
                     CLAUDE_CODE_BETA.to_string()
-                }
-            } else {
-                // 如果客户端没有发送，使用默认值
-                CLAUDE_CODE_BETA.to_string()
-            };
-            request = request.header("anthropic-beta", &beta_value);
+                };
+                request = request.header("anthropic-beta", &beta_value);
+            }
         }
 
         // 客户端 IP 透传（默认开启）
@@ -912,18 +1096,37 @@ impl RequestForwarder {
         }
 
         // 使用适配器添加认证头
-        if let Some(auth) = adapter.extract_auth(provider) {
+        // 对于 OpenAI 兼容端点（openai_chat/openai_responses），只发送 Bearer token，
+        // 不发送 Anthropic 特有的 x-api-key header（本地模型不识别）
+        if let Some(mut auth) = adapter.extract_auth(provider) {
+            if adapter.name() == "Claude" {
+                let api_format = super::providers::get_claude_api_format(provider);
+                let is_openai_compatible =
+                    api_format == "openai_chat" || api_format == "openai_responses";
+                if is_openai_compatible {
+                    // 切换为 Bearer 策略，避免发送 x-api-key
+                    auth = super::providers::AuthInfo::new(auth.api_key, super::providers::AuthStrategy::Bearer);
+                }
+            }
             request = adapter.add_auth_headers(request, &auth);
         }
 
-        // anthropic-version 统一处理（仅 Claude）：优先使用客户端的版本号，否则使用默认值
+        // anthropic-version 统一处理（仅 Claude 原生格式）：优先使用客户端的版本号，否则使用默认值
         // 注意：只设置一次，避免重复
+        //
+        // 注意：当 apiFormat="openai_chat" 或 "openai_responses" 时，不添加此 header
+        // 因为目标服务可能不认识 Anthropic 特定的 headers
         if adapter.name() == "Claude" {
-            let version_str = headers
-                .get("anthropic-version")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("2023-06-01");
-            request = request.header("anthropic-version", version_str);
+            let api_format = super::providers::get_claude_api_format(provider);
+            let is_openai_compatible = api_format == "openai_chat" || api_format == "openai_responses";
+
+            if !is_openai_compatible {
+                let version_str = headers
+                    .get("anthropic-version")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("2023-06-01");
+                request = request.header("anthropic-version", version_str);
+            }
         }
 
         // 输出请求信息日志
@@ -934,9 +1137,74 @@ impl RequestForwarder {
             .unwrap_or("<none>");
         log::info!("[{tag}] >>> 请求 URL: {url} (model={request_model})");
         if let Ok(body_str) = serde_json::to_string(&filtered_body) {
+            let body_len = body_str.len();
+            // INFO 级别：始终记录请求体大小和预览（帮助诊断 502/超时等问题）
+            log::info!(
+                "[{tag}] >>> 请求体大小: {} 字符 (约 {}KB)",
+                body_len,
+                body_len / 1024
+            );
+            // 请求体预览（前 2000 字符，帮助诊断格式问题）
+            let preview = if body_len > 2000 {
+                format!("{}...(截断，共 {} 字符)", &body_str[..2000], body_len)
+            } else {
+                body_str.clone()
+            };
+            log::info!("[{tag}] >>> 请求体预览: {}", preview);
+            // 请求体各部分大小分析（帮助诊断请求体构成）
+            if let Some(body_obj) = filtered_body.as_object() {
+                // System prompt 大小
+                if let Some(system) = body_obj.get("system") {
+                    let sys_str = serde_json::to_string(system).unwrap_or_default();
+                    log::info!(
+                        "[{tag}] 📊 请求体分析: system = {} 字符 ({:.0}KB)",
+                        sys_str.len(),
+                        sys_str.len() as f64 / 1024.0
+                    );
+                }
+                // Messages 大小
+                if let Some(messages) = body_obj.get("messages").and_then(|m| m.as_array()) {
+                    let msg_count = messages.len();
+                    let msg_total: usize = messages.iter()
+                        .map(|m| serde_json::to_string(m).unwrap_or_default().len())
+                        .sum();
+                    log::info!(
+                        "[{tag}] 📊 请求体分析: messages = {} 条, {} 字符 ({:.0}KB)",
+                        msg_count, msg_total, msg_total as f64 / 1024.0
+                    );
+                }
+                // Tools 大小
+                if let Some(tools) = body_obj.get("tools").and_then(|t| t.as_array()) {
+                    let tool_count = tools.len();
+                    let tools_total: usize = tools.iter()
+                        .map(|t| serde_json::to_string(t).unwrap_or_default().len())
+                        .sum();
+                    log::info!(
+                        "[{tag}] 📊 请求体分析: tools = {} 个, {} 字符 ({:.0}KB)",
+                        tool_count, tools_total, tools_total as f64 / 1024.0
+                    );
+                }
+                // Model mapping 字段
+                if let Some(model) = body_obj.get("model") {
+                    if let Some(model_str) = model.as_str() {
+                        log::info!("[{tag}] 📊 请求体分析: model = {}", model_str);
+                    }
+                }
+            }
+            // 请求体大小预警：本地模型通常对请求体大小敏感
+            // llama.cpp 等本地推理引擎在请求体过大时可能直接断开连接（502）
+            if is_openai_compatible && body_len > 100_000 {
+                log::warn!(
+                    "[{tag}] ⚠ 请求体过大 ({:.0}KB)！本地模型可能无法处理此大小的请求。\
+                     建议：减少工具数量、缩短 system prompt、或增加模型上下文窗口。\
+                     当前 skill 注入模式: {}",
+                    body_len as f64 / 1024.0,
+                    injection_mode,
+                );
+            }
+            // DEBUG 级别：完整请求体
             log::debug!(
-                "[{tag}] >>> 请求体内容 ({}字节): {}",
-                body_str.len(),
+                "[{tag}] >>> 请求体完整内容: {}",
                 body_str
             );
         }
@@ -959,7 +1227,24 @@ impl RequestForwarder {
             Ok(response)
         } else {
             let status_code = status.as_u16();
+            // 记录响应头（帮助诊断上游服务类型和错误详情）
+            let resp_headers: Vec<(String, String)> = response.headers().iter()
+                .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("<non-ascii>").to_string()))
+                .collect();
             let body_text = response.text().await.ok();
+            log::info!(
+                "[{tag}] <<< 上游响应头 (HTTP {status_code}): {:?}",
+                resp_headers
+            );
+
+            // 记录上游错误详情（帮助诊断 502 等问题）
+            log::warn!(
+                "[{tag}] <<< 上游错误: HTTP {status_code}, URL: {url}, model={request_model}, 响应体: {:?}",
+                body_text.as_deref().map(|b| {
+                    // 截断过长的响应体
+                    if b.len() > 500 { format!("{}...(截断)", &b[..500]) } else { b.to_string() }
+                })
+            );
 
             Err(ProxyError::UpstreamError {
                 status: status_code,

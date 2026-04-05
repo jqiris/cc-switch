@@ -22,6 +22,7 @@ pub mod provider_router;
 pub mod providers;
 pub mod response_handler;
 pub mod response_processor;
+pub mod skill_compressor;
 pub mod skill_trigger;
 pub(crate) mod server;
 pub mod session;
