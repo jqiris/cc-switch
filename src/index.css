@@ -192,40 +192,35 @@ input[type="password"]::-ms-clear {
   display: none;
 }
 
-::view-transition-old(root),
-::view-transition-new(root) {
-  animation: none;
-  mix-blend-mode: normal;
+/*
+ * Usage date-range picker popover.
+ *
+ * The two-column layout (date fields | calendar) must depend on how much
+ * width the popover itself actually has — not on the viewport. The popover is
+ * clamped to `100vw - 2rem` and anchored to its trigger, so a viewport-based
+ * breakpoint (e.g. Tailwind `sm:`) could enable the wide layout while the
+ * popover only had room for one column, pushing the calendar off-screen.
+ *
+ * A container query keys the layout to the popover's own inline size. The base
+ * (stacked) layout is the safe fallback when container queries are
+ * unsupported, keeping the calendar fully visible at any width.
+ */
+.usage-range-popover {
+  container-type: inline-size;
 }
 
-::view-transition-old(root) {
-  z-index: 1;
-}
-
-::view-transition-new(root) {
-  z-index: 9999;
-}
-
-@keyframes theme-circle-expand {
-  from {
-    clip-path: circle(
-      0% at var(--theme-transition-x, 50%) var(--theme-transition-y, 50%)
-    );
+@container (min-width: 500px) {
+  .usage-range-layout {
+    flex-direction: row;
   }
 
-  to {
-    clip-path: circle(
-      150% at var(--theme-transition-x, 50%) var(--theme-transition-y, 50%)
-    );
+  .usage-range-fields {
+    width: 250px;
+    flex: none;
   }
-}
 
-::view-transition-new(root) {
-  animation: theme-circle-expand 0.4s ease-out;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  ::view-transition-new(root) {
-    animation: none;
+  .usage-range-calendar {
+    min-width: 0;
+    flex: 1 1 0%;
   }
 }

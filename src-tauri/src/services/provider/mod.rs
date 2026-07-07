@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::app_config::AppType;
+use crate::database::{validate_cost_multiplier, validate_pricing_source};
 use crate::error::AppError;
 use crate::provider::{Provider, UsageResult};
 use crate::services::mcp::McpService;
@@ -21,23 +22,67 @@ use crate::store::AppState;
 
 // Re-export sub-module functions for external access
 pub use live::{
-    import_default_config, import_openclaw_providers_from_live,
-    import_opencode_providers_from_live, read_live_settings, sync_current_to_live,
+    import_default_config, import_hermes_providers_from_live, import_openclaw_providers_from_live,
+    import_opencode_providers_from_live, read_live_settings,
+    should_import_default_config_on_startup, sync_current_to_live,
 };
 
 // Internal re-exports (pub(crate))
 pub(crate) use live::sanitize_claude_settings_for_live;
 pub(crate) use live::{
     build_effective_settings_with_common_config, normalize_provider_common_config_for_storage,
-    strip_common_config_from_live_settings, sync_current_provider_for_app_to_live,
-    write_live_with_common_config,
+    provider_exists_in_live_config, strip_common_config_from_live_settings,
+    sync_current_provider_for_app_to_live, write_live_with_common_config,
 };
 
 // Internal re-exports
 use live::{
-    remove_openclaw_provider_from_live, remove_opencode_provider_from_live, write_gemini_live,
+    remove_hermes_provider_from_live, remove_openclaw_provider_from_live,
+    remove_opencode_provider_from_live, write_gemini_live,
 };
 use usage::validate_usage_script;
+
+/// 统一会话开关变更后，立即按新开关状态重写当前官方 Codex 供应商的
+/// live 配置，使开关即时生效（无需等下一次切换）。
+/// 当前供应商非官方（或不存在）时为 no-op：注入只作用于官方配置，
+/// 第三方 live 配置不受开关影响。
+pub fn reapply_current_codex_official_live(state: &AppState) -> Result<bool, AppError> {
+    let current_id = ProviderService::current(state, AppType::Codex)?;
+    if current_id.is_empty() {
+        return Ok(false);
+    }
+    let providers = state.db.get_all_providers(AppType::Codex.as_str())?;
+    let Some(provider) = providers.get(&current_id) else {
+        return Ok(false);
+    };
+    if provider.category.as_deref() != Some("official") {
+        return Ok(false);
+    }
+
+    // 代理接管期间 live 归代理所有（开启代理时官方供应商只警告不拦截，
+    // 二者可以共存）。与切换/保存路径一致：以 backup/占位符为所有权信号，
+    // 只更新备份，注入后的配置由接管释放时的恢复路径落盘。
+    let has_live_backup =
+        futures::executor::block_on(state.db.get_live_backup(AppType::Codex.as_str()))
+            .ok()
+            .flatten()
+            .is_some();
+    let live_taken_over = state
+        .proxy_service
+        .detect_takeover_in_live_config_for_app(&AppType::Codex);
+    if has_live_backup || live_taken_over {
+        futures::executor::block_on(
+            state
+                .proxy_service
+                .update_live_backup_from_provider(AppType::Codex.as_str(), provider),
+        )
+        .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
+        return Ok(true);
+    }
+
+    live::write_live_with_common_config(&state.db, &AppType::Codex, provider)?;
+    Ok(true)
+}
 
 /// Provider business logic service
 pub struct ProviderService;
@@ -52,7 +97,545 @@ pub struct SwitchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "macos", windows))]
+    use crate::claude_desktop_config::PROFILE_ID;
+    use crate::config::{get_claude_settings_path, read_json_file, write_json_file};
+    use crate::database::Database;
+    #[cfg(any(target_os = "macos", windows))]
+    use crate::provider::{ClaudeDesktopMode, ClaudeDesktopModelRoute};
+    use crate::provider::{ProviderMeta, UsageScript};
+    use crate::proxy::types::ProxyConfig;
+    use crate::store::AppState;
     use serde_json::json;
+    use serial_test::serial;
+    use std::env;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tempfile::TempDir;
+
+    struct TempHome {
+        #[allow(dead_code)]
+        dir: TempDir,
+        original_home: Option<String>,
+        #[cfg(windows)]
+        original_local_app_data: Option<String>,
+        original_userprofile: Option<String>,
+        original_test_home: Option<String>,
+    }
+
+    impl TempHome {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("failed to create temp home");
+            let original_home = env::var("HOME").ok();
+            #[cfg(windows)]
+            let original_local_app_data = env::var("LOCALAPPDATA").ok();
+            let original_userprofile = env::var("USERPROFILE").ok();
+            let original_test_home = env::var("CC_SWITCH_TEST_HOME").ok();
+
+            env::set_var("HOME", dir.path());
+            #[cfg(windows)]
+            env::set_var("LOCALAPPDATA", dir.path().join("AppData").join("Local"));
+            env::set_var("USERPROFILE", dir.path());
+            env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+
+            Self {
+                dir,
+                original_home,
+                #[cfg(windows)]
+                original_local_app_data,
+                original_userprofile,
+                original_test_home,
+            }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            match &self.original_home {
+                Some(value) => env::set_var("HOME", value),
+                None => env::remove_var("HOME"),
+            }
+
+            #[cfg(windows)]
+            {
+                match &self.original_local_app_data {
+                    Some(value) => env::set_var("LOCALAPPDATA", value),
+                    None => env::remove_var("LOCALAPPDATA"),
+                }
+            }
+
+            match &self.original_userprofile {
+                Some(value) => env::set_var("USERPROFILE", value),
+                None => env::remove_var("USERPROFILE"),
+            }
+
+            match &self.original_test_home {
+                Some(value) => env::set_var("CC_SWITCH_TEST_HOME", value),
+                None => env::remove_var("CC_SWITCH_TEST_HOME"),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn claude_desktop_profile_path(home: &Path) -> PathBuf {
+        home.join("AppData")
+            .join("Local")
+            .join("Claude-3p")
+            .join("configLibrary")
+            .join(format!("{PROFILE_ID}.json"))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn claude_desktop_profile_path(home: &Path) -> PathBuf {
+        home.join("Library")
+            .join("Application Support")
+            .join("Claude-3p")
+            .join("configLibrary")
+            .join(format!("{PROFILE_ID}.json"))
+    }
+
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+
+    fn with_test_home<T>(test: impl FnOnce(&AppState, &Path) -> T) -> T {
+        let _guard = test_guard();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let old_test_home = std::env::var_os("CC_SWITCH_TEST_HOME");
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("CC_SWITCH_TEST_HOME", temp.path());
+        std::env::set_var("HOME", temp.path());
+
+        let db = Arc::new(Database::memory().expect("in-memory database"));
+        let state = AppState::new(db);
+        let result = test(&state, temp.path());
+
+        match old_test_home {
+            Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
+            None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
+        }
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+
+        result
+    }
+
+    fn codex_settings(base_url: &str, api_key: &str) -> Value {
+        json!({
+            "auth": {
+                "OPENAI_API_KEY": api_key
+            },
+            "config": format!(
+                "model_provider = \"custom\"\n\
+                 [model_providers.custom]\n\
+                 name = \"custom\"\n\
+                 base_url = \"{base_url}\"\n\
+                 wire_api = \"chat\"\n"
+            )
+        })
+    }
+
+    fn usage_script_with_credentials(
+        api_key: Option<&str>,
+        base_url: Option<&str>,
+        template_type: Option<&str>,
+    ) -> UsageScript {
+        UsageScript {
+            enabled: true,
+            language: "javascript".to_string(),
+            code: "return { remaining: 1, unit: 'USD' };".to_string(),
+            timeout: Some(10),
+            api_key: api_key.map(str::to_string),
+            base_url: base_url.map(str::to_string),
+            access_token: None,
+            user_id: None,
+            template_type: template_type.map(str::to_string),
+            auto_query_interval: None,
+            coding_plan_provider: None,
+            access_key_id: Some("ak-test".to_string()),
+            secret_access_key: Some("sk-test".to_string()),
+        }
+    }
+
+    fn codex_provider_with_usage(
+        id: &str,
+        base_url: &str,
+        api_key: &str,
+        usage_api_key: Option<&str>,
+        usage_base_url: Option<&str>,
+        template_type: Option<&str>,
+    ) -> Provider {
+        let mut provider = Provider::with_id(
+            id.to_string(),
+            format!("Provider {id}"),
+            codex_settings(base_url, api_key),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            usage_script: Some(usage_script_with_credentials(
+                usage_api_key,
+                usage_base_url,
+                template_type,
+            )),
+            ..Default::default()
+        });
+        provider
+    }
+
+    fn openclaw_provider(id: &str) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: format!("Provider {id}"),
+            settings_config: json!({
+                "baseUrl": "https://api.deepseek.com",
+                "apiKey": "test-key",
+                "api": "openai-completions",
+                "models": [],
+            }),
+            website_url: None,
+            category: Some("custom".to_string()),
+            created_at: Some(1),
+            sort_index: Some(0),
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
+    fn opencode_provider(id: &str) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: format!("Provider {id}"),
+            settings_config: json!({
+                "npm": "@ai-sdk/openai-compatible",
+                "name": format!("Provider {id}"),
+                "options": {
+                    "baseURL": "https://api.example.com/v1",
+                    "apiKey": "test-key"
+                },
+                "models": {
+                    "gpt-4o": {
+                        "name": "GPT-4o"
+                    }
+                }
+            }),
+            website_url: None,
+            category: Some("custom".to_string()),
+            created_at: Some(1),
+            sort_index: Some(0),
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
+    fn opencode_omo_provider(id: &str, category: &str) -> Provider {
+        let mut settings = serde_json::Map::new();
+        settings.insert(
+            "agents".to_string(),
+            json!({
+                "writer": {
+                    "model": "gpt-4o-mini"
+                }
+            }),
+        );
+        if category == "omo" {
+            settings.insert(
+                "categories".to_string(),
+                json!({
+                    "default": ["writer"]
+                }),
+            );
+        }
+        settings.insert(
+            "otherFields".to_string(),
+            json!({
+                "theme": "dark"
+            }),
+        );
+
+        Provider {
+            id: id.to_string(),
+            name: format!("Provider {id}"),
+            settings_config: Value::Object(settings),
+            website_url: None,
+            category: Some(category.to_string()),
+            created_at: Some(1),
+            sort_index: Some(0),
+            notes: None,
+            meta: None,
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
+    fn omo_config_path(home: &Path, category: &str) -> PathBuf {
+        home.join(".config").join("opencode").join(match category {
+            "omo" => crate::services::omo::STANDARD.preferred_filename,
+            "omo-slim" => crate::services::omo::SLIM.preferred_filename,
+            other => panic!("unexpected OMO category in test: {other}"),
+        })
+    }
+
+    #[test]
+    #[serial]
+    fn add_clears_usage_credentials_that_match_provider_config() {
+        with_test_home(|state, _| {
+            let provider = codex_provider_with_usage(
+                "codex-a",
+                "https://api.a.example/v1/",
+                "sk-a",
+                Some(" sk-a "),
+                Some(" https://api.a.example/v1/ "),
+                None,
+            );
+
+            ProviderService::add(state, AppType::Codex, provider, false).expect("add provider");
+
+            let saved = state
+                .db
+                .get_provider_by_id("codex-a", AppType::Codex.as_str())
+                .expect("query saved provider")
+                .expect("saved provider should exist");
+            let script = saved
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.usage_script.as_ref())
+                .expect("usage script should remain");
+
+            assert_eq!(script.api_key, None);
+            assert_eq!(script.base_url, None);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_preserves_usage_credentials_that_only_match_previous_config() {
+        with_test_home(|state, _| {
+            let provider = codex_provider_with_usage(
+                "codex-usage-old",
+                "https://api.a.example/v1/",
+                "sk-a",
+                Some("sk-a"),
+                Some("https://api.a.example/v1/"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed provider with explicit usage credentials");
+
+            let mut updated = provider.clone();
+            updated.settings_config = codex_settings("https://api.b.example/v1/", "sk-b");
+
+            ProviderService::update(state, AppType::Codex, None, updated)
+                .expect("update provider main credentials");
+
+            let saved = state
+                .db
+                .get_provider_by_id("codex-usage-old", AppType::Codex.as_str())
+                .expect("query updated provider")
+                .expect("updated provider should exist");
+            let script = saved
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.usage_script.as_ref())
+                .expect("usage script should remain");
+
+            assert_eq!(script.api_key.as_deref(), Some("sk-a"));
+            assert_eq!(
+                script.base_url.as_deref(),
+                Some("https://api.a.example/v1/")
+            );
+            assert_eq!(
+                saved.resolve_usage_credentials(&AppType::Codex),
+                ("https://api.b.example/v1".to_string(), "sk-b".to_string())
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn copied_provider_uses_edited_credentials_after_add_clears_mirrored_usage_credentials() {
+        with_test_home(|state, _| {
+            let copied_provider = codex_provider_with_usage(
+                "codex-copy",
+                "https://api.a.example/v1/",
+                "sk-a",
+                Some("sk-a"),
+                Some("https://api.a.example/v1/"),
+                None,
+            );
+
+            ProviderService::add(state, AppType::Codex, copied_provider, false)
+                .expect("add copied provider");
+
+            let saved_after_add = state
+                .db
+                .get_provider_by_id("codex-copy", AppType::Codex.as_str())
+                .expect("query copied provider")
+                .expect("copied provider should exist");
+            let script_after_add = saved_after_add
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.usage_script.as_ref())
+                .expect("usage script should remain");
+            assert_eq!(script_after_add.api_key, None);
+            assert_eq!(script_after_add.base_url, None);
+
+            let mut edited_provider = saved_after_add.clone();
+            edited_provider.settings_config = codex_settings("https://api.b.example/v1/", "sk-b");
+
+            ProviderService::update(state, AppType::Codex, None, edited_provider)
+                .expect("edit copied provider credentials");
+
+            let saved_after_update = state
+                .db
+                .get_provider_by_id("codex-copy", AppType::Codex.as_str())
+                .expect("query edited provider")
+                .expect("edited provider should exist");
+            let script_after_update = saved_after_update
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.usage_script.as_ref())
+                .expect("usage script should remain");
+
+            assert_eq!(script_after_update.api_key, None);
+            assert_eq!(script_after_update.base_url, None);
+            assert_eq!(
+                saved_after_update.resolve_usage_credentials(&AppType::Codex),
+                ("https://api.b.example/v1".to_string(), "sk-b".to_string())
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_clears_usage_credentials_that_match_current_config() {
+        with_test_home(|state, _| {
+            let provider = codex_provider_with_usage(
+                "codex-current",
+                "https://api.a.example/v1",
+                "sk-a",
+                Some("sk-usage"),
+                Some("https://usage.example/api"),
+                None,
+            );
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("seed provider with distinct usage credentials");
+
+            let mut updated = provider.clone();
+            updated.settings_config = codex_settings("https://api.b.example/v1/", "sk-b");
+            updated.meta = Some(ProviderMeta {
+                usage_script: Some(usage_script_with_credentials(
+                    Some(" sk-b "),
+                    Some(" https://api.b.example/v1/ "),
+                    None,
+                )),
+                ..Default::default()
+            });
+
+            ProviderService::update(state, AppType::Codex, None, updated)
+                .expect("update provider with redundant usage credentials");
+
+            let saved = state
+                .db
+                .get_provider_by_id("codex-current", AppType::Codex.as_str())
+                .expect("query updated provider")
+                .expect("updated provider should exist");
+            let script = saved
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.usage_script.as_ref())
+                .expect("usage script should remain");
+
+            assert_eq!(script.api_key, None);
+            assert_eq!(script.base_url, None);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn add_preserves_distinct_usage_credentials() {
+        with_test_home(|state, _| {
+            let provider = codex_provider_with_usage(
+                "codex-distinct",
+                "https://api.main.example/v1",
+                "sk-main",
+                Some("sk-usage"),
+                Some("https://usage.example/api"),
+                None,
+            );
+
+            ProviderService::add(state, AppType::Codex, provider, false).expect("add provider");
+
+            let saved = state
+                .db
+                .get_provider_by_id("codex-distinct", AppType::Codex.as_str())
+                .expect("query saved provider")
+                .expect("saved provider should exist");
+            let script = saved
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.usage_script.as_ref())
+                .expect("usage script should remain");
+
+            assert_eq!(script.api_key.as_deref(), Some("sk-usage"));
+            assert_eq!(
+                script.base_url.as_deref(),
+                Some("https://usage.example/api")
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn add_does_not_clear_token_plan_credentials() {
+        with_test_home(|state, _| {
+            let provider = codex_provider_with_usage(
+                "codex-token-plan",
+                "https://api.plan.example/v1",
+                "sk-plan",
+                Some("sk-plan"),
+                Some("https://api.plan.example/v1"),
+                Some("token_plan"),
+            );
+
+            ProviderService::add(state, AppType::Codex, provider, false).expect("add provider");
+
+            let saved = state
+                .db
+                .get_provider_by_id("codex-token-plan", AppType::Codex.as_str())
+                .expect("query saved provider")
+                .expect("saved provider should exist");
+            let script = saved
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.usage_script.as_ref())
+                .expect("usage script should remain");
+
+            assert_eq!(script.api_key.as_deref(), Some("sk-plan"));
+            assert_eq!(
+                script.base_url.as_deref(),
+                Some("https://api.plan.example/v1")
+            );
+            assert_eq!(script.access_key_id.as_deref(), Some("ak-test"));
+            assert_eq!(script.secret_access_key.as_deref(), Some("sk-test"));
+        });
+    }
 
     #[test]
     fn validate_provider_settings_rejects_missing_auth() {
@@ -68,6 +651,112 @@ mod tests {
             err.to_string().contains("auth"),
             "expected auth error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn extract_claude_common_config_strips_all_credentials_keeps_shareable() {
+        // env 混入多种凭据（Anthropic/OpenRouter/Google/OpenAI/Gemini + AWS/Vertex）
+        // 与可共享配置；顶层混入非标准的 apiKey/api_key 凭据与正常设置。
+        let settings = json!({
+            "env": {
+                "ANTHROPIC_API_KEY": "sk-ant",
+                "ANTHROPIC_AUTH_TOKEN": "tok-ant",
+                "OPENROUTER_API_KEY": "sk-or",
+                "GOOGLE_API_KEY": "g-key",
+                "OPENAI_API_KEY": "sk-oai",
+                "GEMINI_API_KEY": "g-gem",
+                "AWS_ACCESS_KEY_ID": "AKIA",
+                "AWS_SECRET_ACCESS_KEY": "secret",
+                "AWS_SESSION_TOKEN": "sess",
+                "GOOGLE_APPLICATION_CREDENTIALS": "/path/creds.json",
+                "AWS_BEARER_TOKEN_BEDROCK": "bedrock-tok",
+                "ANTHROPIC_BASE_URL": "https://example.com",
+                "ANTHROPIC_MODEL": "claude-x",
+                // 可共享、非机密配置（复数 _TOKENS 不应被误剥）
+                "ENABLE_TOOL_SEARCH": "true",
+                "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "8192"
+            },
+            "apiKey": "sk-top",
+            "api_key": "sk-top2",
+            "theme": "dark",
+            "includeCoAuthoredBy": false
+        });
+
+        let snippet = ProviderService::extract_claude_common_config(&settings)
+            .expect("extract should succeed");
+        let value: Value = serde_json::from_str(&snippet).expect("snippet is valid JSON");
+
+        // 所有凭据都不得出现在共享片段里
+        let env = value.get("env");
+        for leaked in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "OPENROUTER_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "AWS_BEARER_TOKEN_BEDROCK",
+        ] {
+            assert!(
+                env.and_then(|e| e.get(leaked)).is_none(),
+                "credential {leaked} must not leak into common config"
+            );
+        }
+        assert!(
+            value.get("apiKey").is_none() && value.get("api_key").is_none(),
+            "top-level credentials must be stripped"
+        );
+
+        // 端点/模型（provider-specific 非机密）也应剥掉
+        assert!(env.and_then(|e| e.get("ANTHROPIC_BASE_URL")).is_none());
+        assert!(env.and_then(|e| e.get("ANTHROPIC_MODEL")).is_none());
+
+        // 可共享的非机密配置必须保留（含复数 _TOKENS 不被误剥）
+        assert_eq!(
+            env.and_then(|e| e.get("ENABLE_TOOL_SEARCH"))
+                .and_then(|v| v.as_str()),
+            Some("true")
+        );
+        assert_eq!(
+            env.and_then(|e| e.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"))
+                .and_then(|v| v.as_str()),
+            Some("8192")
+        );
+        assert_eq!(value.get("theme").and_then(|v| v.as_str()), Some("dark"));
+        assert_eq!(value.get("includeCoAuthoredBy"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn validate_provider_settings_rejects_negative_cost_multiplier() {
+        let mut provider = Provider::with_id(
+            "claude".into(),
+            "Claude".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "token",
+                    "ANTHROPIC_BASE_URL": "https://claude.example"
+                }
+            }),
+            None,
+        );
+        provider.meta = Some(ProviderMeta {
+            cost_multiplier: Some("-1".to_string()),
+            ..ProviderMeta::default()
+        });
+
+        let err = ProviderService::validate_provider_settings(&AppType::Claude, &provider)
+            .expect_err("negative multiplier should be rejected");
+        assert!(matches!(
+            err,
+            AppError::Localized {
+                key: "error.invalidMultiplier",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -129,6 +818,732 @@ base_url = "http://localhost:8080"
             "should keep mcp_servers.* base_url"
         );
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn update_current_claude_provider_syncs_live_when_proxy_takeover_detected_without_backup()
+    {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+
+        let original = Provider::with_id(
+            "p1".into(),
+            "Claude A".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "token-a",
+                    "ANTHROPIC_BASE_URL": "https://api.a.example",
+                    "ANTHROPIC_MODEL": "model-a"
+                },
+                "permissions": { "allow": ["Bash"] }
+            }),
+            None,
+        );
+        db.save_provider("claude", &original)
+            .expect("save provider");
+        db.set_current_provider("claude", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some("p1"))
+            .expect("set local current provider");
+
+        db.update_proxy_config(ProxyConfig {
+            live_takeover_active: true,
+            listen_port: 0,
+            ..Default::default()
+        })
+        .await
+        .expect("update proxy config");
+        {
+            let mut config = db
+                .get_proxy_config_for_app("claude")
+                .await
+                .expect("get app proxy config");
+            config.enabled = true;
+            db.update_proxy_config_for_app(config)
+                .await
+                .expect("update app proxy config");
+        }
+
+        write_json_file(
+            &get_claude_settings_path(),
+            &json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "http://127.0.0.1:15721",
+                    "ANTHROPIC_API_KEY": "PROXY_MANAGED",
+                    "ANTHROPIC_MODEL": "stale-model"
+                },
+                "permissions": { "allow": ["Bash"] }
+            }),
+        )
+        .expect("seed taken-over live file");
+
+        let proxy_info = state
+            .proxy_service
+            .start()
+            .await
+            .expect("start proxy service");
+
+        let updated = Provider::with_id(
+            "p1".into(),
+            "Claude A".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_API_KEY": "token-updated",
+                    "ANTHROPIC_BASE_URL": "https://api.updated.example",
+                    "ANTHROPIC_MODEL": "model-updated"
+                },
+                "permissions": { "allow": ["Read"] }
+            }),
+            None,
+        );
+
+        ProviderService::update(&state, AppType::Claude, None, updated.clone())
+            .expect("update current provider");
+
+        let backup = db
+            .get_live_backup("claude")
+            .await
+            .expect("get live backup")
+            .expect("backup exists");
+        let stored_provider = db
+            .get_provider_by_id("p1", "claude")
+            .expect("get stored provider")
+            .expect("stored provider exists");
+        let expected_backup =
+            serde_json::to_string(&stored_provider.settings_config).expect("serialize");
+        assert_eq!(backup.original_config, expected_backup);
+
+        let live: Value = read_json_file(&get_claude_settings_path()).expect("read live");
+        assert_eq!(
+            live.get("permissions"),
+            updated.settings_config.get("permissions"),
+            "provider edits should propagate into Claude live config during takeover"
+        );
+        assert_eq!(
+            live.get("env")
+                .and_then(|env| env.get("ANTHROPIC_API_KEY"))
+                .and_then(|v| v.as_str()),
+            Some("PROXY_MANAGED"),
+            "takeover placeholder should stay intact"
+        );
+        assert_eq!(
+            live.get("env")
+                .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+                .and_then(|v| v.as_str()),
+            Some(format!("http://127.0.0.1:{}", proxy_info.port).as_str()),
+            "proxy base URL should stay intact"
+        );
+        assert!(
+            live.get("env")
+                .and_then(|env| env.get("ANTHROPIC_MODEL"))
+                .is_none(),
+            "model override should be removed in takeover live config"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[tokio::test]
+    #[serial]
+    async fn update_current_claude_desktop_provider_syncs_profile_when_proxy_takeover_is_active() {
+        let home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+
+        let mut original = Provider::with_id(
+            "p1".into(),
+            "Desktop A".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "token-a",
+                    "ANTHROPIC_BASE_URL": "https://opencode.ai/zen/go"
+                }
+            }),
+            None,
+        );
+        original.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".into()),
+            claude_desktop_mode: Some(ClaudeDesktopMode::Proxy),
+            claude_desktop_model_routes: std::collections::HashMap::from([(
+                "claude-sonnet-4-6".into(),
+                ClaudeDesktopModelRoute {
+                    model: "deepseek-v4-flash".into(),
+                    label_override: Some("DeepSeek V4 Flash".into()),
+                    supports_1m: None,
+                },
+            )]),
+            ..Default::default()
+        });
+        db.save_provider("claude-desktop", &original)
+            .expect("save provider");
+        db.set_current_provider("claude-desktop", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::ClaudeDesktop, Some("p1"))
+            .expect("set local current provider");
+
+        // Claude Desktop keeps backup state from takeover startup; this sentinel only
+        // marks takeover as active so provider updates rewrite the 3P profile.
+        db.save_live_backup("claude-desktop", "{}")
+            .await
+            .expect("seed live backup");
+        {
+            let mut config = db
+                .get_proxy_config_for_app("claude-desktop")
+                .await
+                .expect("get app proxy config");
+            config.enabled = true;
+            db.update_proxy_config_for_app(config)
+                .await
+                .expect("update app proxy config");
+        }
+
+        state
+            .proxy_service
+            .start()
+            .await
+            .expect("start proxy service");
+
+        let mut updated = Provider::with_id(
+            "p1".into(),
+            "Desktop A".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "token-updated",
+                    "ANTHROPIC_BASE_URL": "https://opencode.ai/zen/go"
+                }
+            }),
+            None,
+        );
+        updated.meta = Some(ProviderMeta {
+            api_format: Some("openai_chat".into()),
+            claude_desktop_mode: Some(ClaudeDesktopMode::Proxy),
+            claude_desktop_model_routes: std::collections::HashMap::from([(
+                "claude-sonnet-4-6".into(),
+                ClaudeDesktopModelRoute {
+                    model: "deepseek-v4-flash".into(),
+                    label_override: Some("DeepSeek V4 Flash Updated".into()),
+                    supports_1m: Some(true),
+                },
+            )]),
+            ..Default::default()
+        });
+
+        ProviderService::update(&state, AppType::ClaudeDesktop, None, updated.clone())
+            .expect("update current provider");
+
+        let backup = db
+            .get_live_backup("claude-desktop")
+            .await
+            .expect("get live backup")
+            .expect("backup exists");
+        assert_eq!(
+            backup.original_config, "{}",
+            "Claude Desktop provider edits should not rewrite takeover backup"
+        );
+
+        let profile_path = claude_desktop_profile_path(home.dir.path());
+        let profile: Value = read_json_file(&profile_path).expect("read desktop profile");
+        assert_eq!(
+            profile["inferenceGatewayBaseUrl"],
+            json!("http://127.0.0.1:15721/claude-desktop"),
+            "desktop profile should stay pointed at the local gateway during takeover"
+        );
+        assert_eq!(profile["inferenceGatewayAuthScheme"], json!("bearer"));
+        assert_eq!(
+            profile["inferenceModels"],
+            json!([{ "name": "claude-sonnet-4-6", "labelOverride": "DeepSeek V4 Flash Updated", "supports1m": true }]),
+            "provider edits should propagate into the Claude Desktop 3P profile during takeover"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn rename_rejects_missing_original_provider() {
+        with_test_home(|state, _| {
+            let original = openclaw_provider("deepseek");
+            ProviderService::add(state, AppType::OpenClaw, original.clone(), false)
+                .expect("seed db-only provider");
+
+            let mut renamed = original.clone();
+            renamed.id = "deepseek-copy".to_string();
+
+            let err = ProviderService::update(
+                state,
+                AppType::OpenClaw,
+                Some("missing-provider"),
+                renamed,
+            )
+            .expect_err("stale originalId should be rejected");
+
+            assert!(
+                err.to_string().contains("Original provider"),
+                "expected missing original provider error, got {err:?}"
+            );
+            assert!(
+                state
+                    .db
+                    .get_provider_by_id("deepseek-copy", AppType::OpenClaw.as_str())
+                    .expect("query renamed provider")
+                    .is_none(),
+                "rename must not create a new row when originalId is stale"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn db_only_additive_update_survives_live_config_parse_errors() {
+        with_test_home(|state, home| {
+            let provider = openclaw_provider("deepseek");
+            ProviderService::add(state, AppType::OpenClaw, provider.clone(), false)
+                .expect("seed db-only provider");
+
+            let stored = state
+                .db
+                .get_provider_by_id("deepseek", AppType::OpenClaw.as_str())
+                .expect("query stored provider")
+                .expect("provider should exist");
+            assert_eq!(
+                stored
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.live_config_managed),
+                Some(false),
+                "db-only provider should be marked as not live-managed"
+            );
+
+            let openclaw_dir = home.join(".openclaw");
+            fs::create_dir_all(&openclaw_dir).expect("create openclaw dir");
+            fs::write(openclaw_dir.join("openclaw.json"), "{ invalid json5")
+                .expect("write malformed config");
+
+            let mut updated = stored.clone();
+            updated.name = "DeepSeek Edited".to_string();
+            updated.meta.get_or_insert_with(ProviderMeta::default);
+
+            ProviderService::update(state, AppType::OpenClaw, None, updated)
+                .expect("db-only update should ignore live parse errors");
+
+            let saved = state
+                .db
+                .get_provider_by_id("deepseek", AppType::OpenClaw.as_str())
+                .expect("query updated provider")
+                .expect("updated provider should exist");
+            assert_eq!(saved.name, "DeepSeek Edited");
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn sync_current_provider_for_app_skips_db_only_opencode_provider() {
+        with_test_home(|state, _| {
+            let provider = opencode_provider("db-only-opencode");
+            ProviderService::add(state, AppType::OpenCode, provider.clone(), false)
+                .expect("seed db-only opencode provider");
+
+            ProviderService::sync_current_provider_for_app(state, AppType::OpenCode)
+                .expect("sync additive opencode providers");
+
+            let live_providers = crate::opencode_config::get_providers()
+                .expect("read opencode providers after sync");
+            assert!(
+                !live_providers.contains_key(&provider.id),
+                "db-only opencode provider should not be written to live during sync"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn sync_current_provider_for_app_skips_db_only_openclaw_provider() {
+        with_test_home(|state, _| {
+            let provider = openclaw_provider("db-only-openclaw");
+            ProviderService::add(state, AppType::OpenClaw, provider.clone(), false)
+                .expect("seed db-only openclaw provider");
+
+            ProviderService::sync_current_provider_for_app(state, AppType::OpenClaw)
+                .expect("sync additive openclaw providers");
+
+            let live_providers = crate::openclaw_config::get_providers()
+                .expect("read openclaw providers after sync");
+            assert!(
+                !live_providers.contains_key(&provider.id),
+                "db-only openclaw provider should not be written to live during sync"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn sync_current_provider_for_app_preserves_legacy_live_opencode_provider() {
+        with_test_home(|state, _| {
+            let provider = opencode_provider("legacy-opencode");
+            crate::opencode_config::set_provider(&provider.id, provider.settings_config.clone())
+                .expect("seed opencode live provider");
+            state
+                .db
+                .save_provider(AppType::OpenCode.as_str(), &provider)
+                .expect("seed legacy opencode provider in db");
+
+            let mut updated = provider.clone();
+            updated.settings_config["options"]["apiKey"] = Value::String("updated-key".to_string());
+            state
+                .db
+                .save_provider(AppType::OpenCode.as_str(), &updated)
+                .expect("update legacy opencode provider in db");
+
+            ProviderService::sync_current_provider_for_app(state, AppType::OpenCode)
+                .expect("sync legacy opencode provider");
+
+            let live_providers =
+                crate::opencode_config::get_providers().expect("read opencode providers");
+            assert_eq!(
+                live_providers
+                    .get(&provider.id)
+                    .and_then(|config| config.get("options"))
+                    .and_then(|options| options.get("apiKey")),
+                Some(&Value::String("updated-key".to_string())),
+                "legacy provider that already exists in live should still be synced"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn sync_current_provider_for_app_restores_legacy_opencode_provider_after_live_reset() {
+        with_test_home(|state, _| {
+            let provider = opencode_provider("legacy-opencode-reset");
+            state
+                .db
+                .save_provider(AppType::OpenCode.as_str(), &provider)
+                .expect("seed legacy opencode provider in db");
+
+            ProviderService::sync_current_provider_for_app(state, AppType::OpenCode)
+                .expect("sync legacy opencode provider after reset");
+
+            let live_providers =
+                crate::opencode_config::get_providers().expect("read opencode providers");
+            assert!(
+                live_providers.contains_key(&provider.id),
+                "legacy opencode provider should be restored when live config is reset"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn sync_current_provider_for_app_restores_legacy_openclaw_provider_after_live_reset() {
+        with_test_home(|state, _| {
+            let mut provider = openclaw_provider("legacy-openclaw-reset");
+            provider.settings_config["models"] = json!([
+                {
+                    "id": "claude-sonnet-4",
+                    "name": "Claude Sonnet 4"
+                }
+            ]);
+            state
+                .db
+                .save_provider(AppType::OpenClaw.as_str(), &provider)
+                .expect("seed legacy openclaw provider in db");
+
+            ProviderService::sync_current_provider_for_app(state, AppType::OpenClaw)
+                .expect("sync legacy openclaw provider after reset");
+
+            let live_providers =
+                crate::openclaw_config::get_providers().expect("read openclaw providers");
+            assert!(
+                live_providers.contains_key(&provider.id),
+                "legacy openclaw provider should be restored when live config is reset"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn import_opencode_providers_from_live_marks_provider_as_live_managed() {
+        with_test_home(|state, _| {
+            let provider = opencode_provider("imported-opencode");
+            crate::opencode_config::set_provider(&provider.id, provider.settings_config.clone())
+                .expect("seed opencode live provider");
+
+            let imported = import_opencode_providers_from_live(state)
+                .expect("import opencode providers from live");
+            assert_eq!(imported, 1);
+
+            let saved = state
+                .db
+                .get_provider_by_id(&provider.id, AppType::OpenCode.as_str())
+                .expect("query imported opencode provider")
+                .expect("imported opencode provider should exist");
+            assert_eq!(
+                saved
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.live_config_managed),
+                Some(true),
+                "providers imported from live should be treated as live-managed"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn import_openclaw_providers_from_live_marks_provider_as_live_managed() {
+        with_test_home(|state, _| {
+            let mut provider = openclaw_provider("imported-openclaw");
+            provider.settings_config["models"] = json!([
+                {
+                    "id": "claude-sonnet-4",
+                    "name": "Claude Sonnet 4"
+                }
+            ]);
+            crate::openclaw_config::set_provider(&provider.id, provider.settings_config.clone())
+                .expect("seed openclaw live provider");
+
+            let imported = import_openclaw_providers_from_live(state)
+                .expect("import openclaw providers from live");
+            assert_eq!(imported, 1);
+
+            let saved = state
+                .db
+                .get_provider_by_id(&provider.id, AppType::OpenClaw.as_str())
+                .expect("query imported openclaw provider")
+                .expect("imported openclaw provider should exist");
+            assert_eq!(
+                saved
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.live_config_managed),
+                Some(true),
+                "providers imported from live should be treated as live-managed"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_additive_provider_still_errors_on_live_config_parse_failure() {
+        with_test_home(|state, home| {
+            let provider = openclaw_provider("legacy-provider");
+            state
+                .db
+                .save_provider(AppType::OpenClaw.as_str(), &provider)
+                .expect("seed legacy provider without live_config_managed marker");
+
+            let openclaw_dir = home.join(".openclaw");
+            fs::create_dir_all(&openclaw_dir).expect("create openclaw dir");
+            fs::write(openclaw_dir.join("openclaw.json"), "{ invalid json5")
+                .expect("write malformed config");
+
+            let mut updated = provider.clone();
+            updated.name = "Legacy Edited".to_string();
+
+            let err = ProviderService::update(state, AppType::OpenClaw, None, updated)
+                .expect_err("legacy providers should still surface live parse errors");
+            assert!(
+                err.to_string().contains("Failed to parse OpenClaw config"),
+                "expected parse error, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_persists_non_current_omo_variants_in_database() {
+        with_test_home(|state, _| {
+            for category in ["omo", "omo-slim"] {
+                let provider = opencode_omo_provider(&format!("{category}-provider"), category);
+                state
+                    .db
+                    .save_provider(AppType::OpenCode.as_str(), &provider)
+                    .unwrap_or_else(|err| panic!("seed {category} provider: {err}"));
+
+                let mut updated = provider.clone();
+                updated.name = format!("Updated {category}");
+                updated.settings_config["agents"]["writer"]["model"] =
+                    Value::String(format!("{category}-next-model"));
+
+                ProviderService::update(state, AppType::OpenCode, None, updated)
+                    .unwrap_or_else(|err| panic!("update {category} provider: {err}"));
+
+                let saved = state
+                    .db
+                    .get_provider_by_id(&provider.id, AppType::OpenCode.as_str())
+                    .unwrap_or_else(|err| panic!("query updated {category} provider: {err}"))
+                    .unwrap_or_else(|| panic!("{category} provider should exist"));
+
+                assert_eq!(saved.name, format!("Updated {category}"));
+                assert_eq!(
+                    saved.settings_config["agents"]["writer"]["model"],
+                    Value::String(format!("{category}-next-model")),
+                    "{category} updates should persist in the database"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_current_omo_variant_rewrites_config_from_saved_provider() {
+        with_test_home(|state, home| {
+            for category in ["omo", "omo-slim"] {
+                let provider = opencode_omo_provider(&format!("{category}-current"), category);
+                state
+                    .db
+                    .save_provider(AppType::OpenCode.as_str(), &provider)
+                    .unwrap_or_else(|err| panic!("seed current {category} provider: {err}"));
+                state
+                    .db
+                    .set_omo_provider_current(AppType::OpenCode.as_str(), &provider.id, category)
+                    .unwrap_or_else(|err| panic!("set current {category} provider: {err}"));
+
+                let mut updated = provider.clone();
+                updated.name = format!("Current {category} updated");
+                updated.settings_config["agents"]["writer"]["model"] =
+                    Value::String(format!("{category}-saved-model"));
+                updated.settings_config["otherFields"]["theme"] =
+                    Value::String(format!("{category}-light"));
+
+                ProviderService::update(state, AppType::OpenCode, None, updated)
+                    .unwrap_or_else(|err| panic!("update current {category} provider: {err}"));
+
+                let saved = state
+                    .db
+                    .get_provider_by_id(&provider.id, AppType::OpenCode.as_str())
+                    .unwrap_or_else(|err| panic!("query current {category} provider: {err}"))
+                    .unwrap_or_else(|| panic!("current {category} provider should exist"));
+                assert_eq!(saved.name, format!("Current {category} updated"));
+
+                let written = fs::read_to_string(omo_config_path(home, category))
+                    .unwrap_or_else(|err| panic!("read written {category} config: {err}"));
+                let written_json: Value = serde_json::from_str(&written)
+                    .unwrap_or_else(|err| panic!("parse written {category} config: {err}"));
+
+                assert_eq!(
+                    written_json["agents"]["writer"]["model"],
+                    Value::String(format!("{category}-saved-model")),
+                    "{category} config should be written from the saved provider state"
+                );
+                assert_eq!(
+                    written_json["theme"],
+                    Value::String(format!("{category}-light")),
+                    "{category} top-level config should reflect updated otherFields"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_current_omo_variant_does_not_persist_database_when_file_write_fails() {
+        with_test_home(|state, home| {
+            let provider = opencode_omo_provider("omo-current", "omo");
+            state
+                .db
+                .save_provider(AppType::OpenCode.as_str(), &provider)
+                .unwrap_or_else(|err| panic!("seed current omo provider: {err}"));
+            state
+                .db
+                .set_omo_provider_current(AppType::OpenCode.as_str(), &provider.id, "omo")
+                .unwrap_or_else(|err| panic!("set current omo provider: {err}"));
+
+            let config_dir = home.join(".config").join("opencode");
+            fs::create_dir_all(config_dir.parent().expect("config dir parent"))
+                .expect("create .config dir");
+            fs::write(&config_dir, "not a directory").expect("block opencode config dir");
+
+            let mut updated = provider.clone();
+            updated.name = "Current omo updated".to_string();
+            updated.settings_config["agents"]["writer"]["model"] =
+                Value::String("omo-saved-model".to_string());
+
+            ProviderService::update(state, AppType::OpenCode, None, updated)
+                .expect_err("update should fail when current omo file write fails");
+
+            let saved = state
+                .db
+                .get_provider_by_id(&provider.id, AppType::OpenCode.as_str())
+                .unwrap_or_else(|err| panic!("query current omo provider: {err}"))
+                .unwrap_or_else(|| panic!("current omo provider should exist"));
+
+            assert_eq!(saved.name, provider.name);
+            assert_eq!(
+                saved.settings_config["agents"]["writer"]["model"],
+                provider.settings_config["agents"]["writer"]["model"],
+                "database should remain unchanged when file write fails"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn update_current_omo_variant_rolls_back_file_when_plugin_sync_fails() {
+        with_test_home(|state, home| {
+            let provider = opencode_omo_provider("omo-current", "omo");
+            state
+                .db
+                .save_provider(AppType::OpenCode.as_str(), &provider)
+                .unwrap_or_else(|err| panic!("seed current omo provider: {err}"));
+            state
+                .db
+                .set_omo_provider_current(AppType::OpenCode.as_str(), &provider.id, "omo")
+                .unwrap_or_else(|err| panic!("set current omo provider: {err}"));
+
+            let config_path = omo_config_path(home, "omo");
+            fs::create_dir_all(config_path.parent().expect("omo config parent"))
+                .expect("create omo config dir");
+            let previous_content = serde_json::to_string_pretty(&json!({
+                "theme": "legacy-live-theme",
+                "agents": {
+                    "writer": {
+                        "model": "legacy-live-model"
+                    }
+                },
+                "categories": {
+                    "default": ["writer"]
+                }
+            }))
+            .expect("serialize previous config");
+            fs::write(&config_path, &previous_content).expect("seed previous omo config");
+
+            let opencode_config_path = home.join(".config").join("opencode").join("opencode.json");
+            fs::write(&opencode_config_path, "{ invalid json").expect("seed malformed opencode");
+
+            let mut updated = provider.clone();
+            updated.name = "Current omo updated".to_string();
+            updated.settings_config["agents"]["writer"]["model"] =
+                Value::String("omo-saved-model".to_string());
+            updated.settings_config["otherFields"]["theme"] =
+                Value::String("omo-light".to_string());
+
+            ProviderService::update(state, AppType::OpenCode, None, updated)
+                .expect_err("update should fail when plugin sync fails");
+
+            let saved = state
+                .db
+                .get_provider_by_id(&provider.id, AppType::OpenCode.as_str())
+                .unwrap_or_else(|err| panic!("query current omo provider: {err}"))
+                .unwrap_or_else(|| panic!("current omo provider should exist"));
+
+            assert_eq!(saved.name, provider.name);
+            assert_eq!(
+                saved.settings_config["agents"]["writer"]["model"],
+                provider.settings_config["agents"]["writer"]["model"],
+                "database should remain unchanged when plugin sync fails"
+            );
+
+            let written =
+                fs::read_to_string(&config_path).expect("read rolled back omo config content");
+            assert_eq!(
+                written, previous_content,
+                "OMO config should roll back to its previous on-disk contents"
+            );
+        });
+    }
 }
 
 impl ProviderService {
@@ -139,6 +1554,100 @@ impl ProviderService {
                 provider.settings_config = v;
             }
         }
+    }
+
+    /// Check whether a provider exists in live config, tolerating parse errors
+    /// only for providers that are explicitly marked as DB-only.
+    fn check_live_config_exists(
+        app_type: &AppType,
+        provider_id: &str,
+        live_config_managed: Option<bool>,
+    ) -> Result<bool, AppError> {
+        if live_config_managed == Some(false) {
+            Ok(provider_exists_in_live_config(app_type, provider_id).unwrap_or(false))
+        } else {
+            provider_exists_in_live_config(app_type, provider_id)
+        }
+    }
+
+    fn provider_live_config_managed(provider: &Provider) -> Option<bool> {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.live_config_managed)
+    }
+
+    fn set_provider_live_config_managed(provider: &mut Provider, managed: bool) {
+        provider
+            .meta
+            .get_or_insert_with(Default::default)
+            .live_config_managed = Some(managed);
+    }
+
+    fn normalize_usage_script_credential_overrides(app_type: &AppType, provider: &mut Provider) {
+        let current_credentials = provider.resolve_usage_credentials(app_type);
+
+        let Some(usage_script) = provider
+            .meta
+            .as_mut()
+            .and_then(|meta| meta.usage_script.as_mut())
+        else {
+            return;
+        };
+
+        if usage_script.template_type.as_deref() == Some("token_plan") {
+            return;
+        }
+
+        if usage_script.api_key.as_deref().is_some_and(|api_key| {
+            Self::should_clear_usage_api_key_override(api_key, &current_credentials)
+        }) {
+            usage_script.api_key = None;
+        }
+
+        if usage_script.base_url.as_deref().is_some_and(|base_url| {
+            Self::should_clear_usage_base_url_override(base_url, &current_credentials)
+        }) {
+            usage_script.base_url = None;
+        }
+    }
+
+    fn should_clear_usage_api_key_override(
+        script_api_key: &str,
+        current_credentials: &(String, String),
+    ) -> bool {
+        let candidate = script_api_key.trim();
+        if candidate.is_empty() {
+            return true;
+        }
+
+        let matches_provider_key = |api_key: &str| {
+            let api_key = api_key.trim();
+            !api_key.is_empty() && api_key == candidate
+        };
+
+        matches_provider_key(&current_credentials.1)
+    }
+
+    fn should_clear_usage_base_url_override(
+        script_base_url: &str,
+        current_credentials: &(String, String),
+    ) -> bool {
+        let candidate = Self::normalize_usage_base_url_for_compare(script_base_url);
+        if candidate.is_empty() {
+            return true;
+        }
+
+        let matches_provider_base_url = |base_url: &str| {
+            let base_url = Self::normalize_usage_base_url_for_compare(base_url);
+            !base_url.is_empty() && base_url == candidate
+        };
+
+        matches_provider_base_url(&current_credentials.0)
+    }
+
+    fn normalize_usage_base_url_for_compare(base_url: &str) -> String {
+        base_url.trim().trim_end_matches('/').to_string()
     }
 
     /// List all providers for an app type
@@ -166,17 +1675,26 @@ impl ProviderService {
     }
 
     /// Add a new provider
-    pub fn add(state: &AppState, app_type: AppType, provider: Provider) -> Result<bool, AppError> {
+    pub fn add(
+        state: &AppState,
+        app_type: AppType,
+        provider: Provider,
+        add_to_live: bool,
+    ) -> Result<bool, AppError> {
         let mut provider = provider;
         // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
         normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
+        Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
+        if app_type.is_additive_mode() {
+            Self::set_provider_live_config_managed(&mut provider, add_to_live);
+        }
 
         // Save to database
         state.db.save_provider(app_type.as_str(), &provider)?;
 
-        // Additive mode apps (OpenCode, OpenClaw) - always write to live config
+        // Additive mode apps (OpenCode, OpenClaw): optionally write to live config.
         if app_type.is_additive_mode() {
             // OMO / OMO Slim providers use exclusive mode and write to dedicated config file.
             if matches!(app_type, AppType::OpenCode)
@@ -184,6 +1702,9 @@ impl ProviderService {
             {
                 // Do not auto-enable newly added OMO / OMO Slim providers.
                 // Users must explicitly switch/apply an OMO provider to activate it.
+                return Ok(true);
+            }
+            if !add_to_live {
                 return Ok(true);
             }
             write_live_with_common_config(state.db.as_ref(), &app_type, &provider)?;
@@ -207,52 +1728,153 @@ impl ProviderService {
     pub fn update(
         state: &AppState,
         app_type: AppType,
+        original_id: Option<&str>,
         provider: Provider,
     ) -> Result<bool, AppError> {
         let mut provider = provider;
+        let original_id = original_id.unwrap_or(provider.id.as_str()).to_string();
+        let provider_id_changed = original_id != provider.id;
+        let existing_provider = state
+            .db
+            .get_provider_by_id(&original_id, app_type.as_str())?;
         // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
         normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
+        Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
 
-        // Save to database
-        state.db.save_provider(app_type.as_str(), &provider)?;
-
-        // Additive mode apps (OpenCode, OpenClaw) - always update in live config
-        if app_type.is_additive_mode() {
-            if matches!(app_type, AppType::OpenCode) && provider.category.as_deref() == Some("omo")
-            {
-                let is_omo_current =
-                    state
-                        .db
-                        .is_omo_provider_current(app_type.as_str(), &provider.id, "omo")?;
-                if is_omo_current {
-                    crate::services::OmoService::write_config_to_file(
-                        state,
-                        &crate::services::omo::STANDARD,
-                    )?;
-                }
-                return Ok(true);
+        if provider_id_changed {
+            if !app_type.is_additive_mode() {
+                return Err(AppError::Message(
+                    "Only additive-mode providers support changing provider key".to_string(),
+                ));
             }
+
+            let Some(existing_provider) = existing_provider else {
+                return Err(AppError::Message(format!(
+                    "Original provider '{}' does not exist in app '{}'",
+                    original_id,
+                    app_type.as_str()
+                )));
+            };
+
+            // OMO / OMO Slim providers are activated via a dedicated current-state mechanism
+            // (set_omo_provider_current) that is NOT captured by provider_exists_in_live_config,
+            // which only checks opencode.json. A rename would orphan that current-state marker
+            // and silently break subsequent OMO file syncs. Block it unconditionally.
             if matches!(app_type, AppType::OpenCode)
-                && provider.category.as_deref() == Some("omo-slim")
+                && matches!(
+                    existing_provider.category.as_deref(),
+                    Some("omo") | Some("omo-slim")
+                )
             {
+                return Err(AppError::Message(
+                    "Provider key cannot be changed for OMO/OMO Slim providers".to_string(),
+                ));
+            }
+
+            let original_in_live = Self::check_live_config_exists(
+                &app_type,
+                &original_id,
+                Self::provider_live_config_managed(&existing_provider),
+            )?;
+            if original_in_live {
+                return Err(AppError::Message(
+                    "Provider key cannot be changed after the provider has been added to the app config"
+                        .to_string(),
+                ));
+            }
+
+            let next_id_in_live = Self::check_live_config_exists(
+                &app_type,
+                &provider.id,
+                Self::provider_live_config_managed(&existing_provider),
+            )?;
+            if state
+                .db
+                .get_provider_by_id(&provider.id, app_type.as_str())?
+                .is_some()
+                || next_id_in_live
+            {
+                return Err(AppError::Message(format!(
+                    "Provider '{}' already exists in app '{}'",
+                    provider.id,
+                    app_type.as_str()
+                )));
+            }
+
+            Self::set_provider_live_config_managed(&mut provider, false);
+            state.db.save_provider(app_type.as_str(), &provider)?;
+            state.db.delete_provider(app_type.as_str(), &original_id)?;
+
+            if crate::settings::get_current_provider(&app_type).as_deref() == Some(&original_id) {
+                crate::settings::set_current_provider(&app_type, Some(provider.id.as_str()))?;
+            }
+
+            return Ok(true);
+        }
+
+        // Additive mode apps (OpenCode, OpenClaw): only sync to live when the provider
+        // already exists in live config. Editing a DB-only provider must not auto-add it.
+        if app_type.is_additive_mode() {
+            let omo_variant = if matches!(app_type, AppType::OpenCode) {
+                match provider.category.as_deref() {
+                    Some("omo") => Some(&crate::services::omo::STANDARD),
+                    Some("omo-slim") => Some(&crate::services::omo::SLIM),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(variant) = omo_variant {
                 let is_current = state.db.is_omo_provider_current(
                     app_type.as_str(),
                     &provider.id,
-                    "omo-slim",
+                    variant.category,
                 )?;
                 if is_current {
-                    crate::services::OmoService::write_config_to_file(
-                        state,
-                        &crate::services::omo::SLIM,
-                    )?;
+                    crate::services::OmoService::write_provider_config_to_file(&provider, variant)?;
                 }
+                if let Err(err) = state.db.save_provider(app_type.as_str(), &provider) {
+                    if is_current {
+                        if let Err(rollback_err) =
+                            crate::services::OmoService::write_config_to_file(state, variant)
+                        {
+                            log::warn!(
+                                "Failed to roll back {} config after DB save error: {}",
+                                variant.label,
+                                rollback_err
+                            );
+                        }
+                    }
+                    return Err(err);
+                }
+                return Ok(true);
+            }
+            let live_config_managed = Self::check_live_config_exists(
+                &app_type,
+                &provider.id,
+                Self::provider_live_config_managed(&provider).or_else(|| {
+                    existing_provider
+                        .as_ref()
+                        .and_then(Self::provider_live_config_managed)
+                }),
+            )?;
+            Self::set_provider_live_config_managed(&mut provider, live_config_managed);
+
+            // Save to database after live-config presence is resolved so parse errors
+            // do not report failure after already mutating DB state.
+            state.db.save_provider(app_type.as_str(), &provider)?;
+
+            if !live_config_managed {
                 return Ok(true);
             }
             write_live_with_common_config(state.db.as_ref(), &app_type, &provider)?;
             return Ok(true);
         }
+
+        // Save to database
+        state.db.save_provider(app_type.as_str(), &provider)?;
 
         // For other apps: Check if this is current provider (use effective current, not just DB)
         let effective_current =
@@ -260,24 +1882,44 @@ impl ProviderService {
         let is_current = effective_current.as_deref() == Some(provider.id.as_str());
 
         if is_current {
-            // 如果代理接管模式处于激活状态，并且代理服务正在运行：
-            // - 不写 Live 配置（否则会破坏接管）
-            // - 仅更新 Live 备份（保证关闭代理时能恢复到最新配置）
-            let is_app_taken_over =
+            // 如果 Claude 代理接管处于激活状态，并且代理服务正在运行：
+            // - 不直接走普通 Live 写入逻辑
+            // - 改为更新 Live 备份，并在 Claude 下同步代理安全的 Live 配置
+            let has_live_backup =
                 futures::executor::block_on(state.db.get_live_backup(app_type.as_str()))
                     .ok()
                     .flatten()
                     .is_some();
-            let is_proxy_running = futures::executor::block_on(state.proxy_service.is_running());
-            let should_skip_live_write = is_app_taken_over && is_proxy_running;
+            let live_taken_over = state
+                .proxy_service
+                .detect_takeover_in_live_config_for_app(&app_type);
+            // Backup or live placeholders mean the live file is currently owned
+            // by proxy takeover, including the short activation window before
+            // proxy_config.enabled is committed.
+            let should_sync_via_proxy = has_live_backup || live_taken_over;
 
-            if should_skip_live_write {
-                futures::executor::block_on(
-                    state
-                        .proxy_service
-                        .update_live_backup_from_provider(app_type.as_str(), &provider),
-                )
-                .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
+            if should_sync_via_proxy {
+                if matches!(app_type, AppType::ClaudeDesktop) {
+                    write_live_with_common_config(state.db.as_ref(), &app_type, &provider)?;
+                } else {
+                    futures::executor::block_on(
+                        state
+                            .proxy_service
+                            .update_live_backup_from_provider(app_type.as_str(), &provider),
+                    )
+                    .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
+                }
+
+                if matches!(app_type, AppType::Claude)
+                    && futures::executor::block_on(state.proxy_service.is_running())
+                {
+                    futures::executor::block_on(
+                        state
+                            .proxy_service
+                            .sync_claude_live_from_provider_while_proxy_active(&provider),
+                    )
+                    .map_err(|e| AppError::Message(format!("同步 Claude Live 配置失败: {e}")))?;
+                }
             } else {
                 write_live_with_common_config(state.db.as_ref(), &app_type, &provider)?;
                 // Sync MCP
@@ -295,50 +1937,49 @@ impl ProviderService {
     pub fn delete(state: &AppState, app_type: AppType, id: &str) -> Result<(), AppError> {
         // Additive mode apps - no current provider concept
         if app_type.is_additive_mode() {
+            // Single DB read shared across all additive-mode sub-paths below.
+            let existing = state.db.get_provider_by_id(id, app_type.as_str())?;
+
             if matches!(app_type, AppType::OpenCode) {
-                let provider_category = state
-                    .db
-                    .get_provider_by_id(id, app_type.as_str())?
-                    .and_then(|p| p.category);
-
-                if provider_category.as_deref() == Some("omo") {
-                    let was_current =
-                        state
-                            .db
-                            .is_omo_provider_current(app_type.as_str(), id, "omo")?;
-
+                let provider_category = existing.as_ref().and_then(|p| p.category.clone());
+                let omo_variant = match provider_category.as_deref() {
+                    Some("omo") => Some(&crate::services::omo::STANDARD),
+                    Some("omo-slim") => Some(&crate::services::omo::SLIM),
+                    _ => None,
+                };
+                if let Some(variant) = omo_variant {
+                    let was_current = state.db.is_omo_provider_current(
+                        app_type.as_str(),
+                        id,
+                        variant.category,
+                    )?;
                     state.db.delete_provider(app_type.as_str(), id)?;
                     if was_current {
-                        crate::services::OmoService::delete_config_file(
-                            &crate::services::omo::STANDARD,
-                        )?;
-                    }
-                    return Ok(());
-                }
-
-                if provider_category.as_deref() == Some("omo-slim") {
-                    let was_current =
-                        state
-                            .db
-                            .is_omo_provider_current(app_type.as_str(), id, "omo-slim")?;
-
-                    state.db.delete_provider(app_type.as_str(), id)?;
-                    if was_current {
-                        crate::services::OmoService::delete_config_file(
-                            &crate::services::omo::SLIM,
-                        )?;
+                        crate::services::OmoService::delete_config_file(variant)?;
                     }
                     return Ok(());
                 }
             }
-            // Remove from database
+
+            // Non-OMO path for both OpenCode and OpenClaw:
+            // remove from live first (atomicity), then DB.
+            //
+            // Use check_live_config_exists rather than trusting the flag alone: the flag
+            // can be stale (Some(false) for a provider that was written to live before the
+            // live_config_managed flip was introduced). check_live_config_exists reads the
+            // actual file when the flag is Some(false), so it handles historical data correctly.
+            let live_managed = existing
+                .as_ref()
+                .and_then(Self::provider_live_config_managed);
+            if Self::check_live_config_exists(&app_type, id, live_managed)? {
+                match app_type {
+                    AppType::OpenCode => remove_opencode_provider_from_live(id)?,
+                    AppType::OpenClaw => remove_openclaw_provider_from_live(id)?,
+                    AppType::Hermes => remove_hermes_provider_from_live(id)?,
+                    _ => {}
+                }
+            }
             state.db.delete_provider(app_type.as_str(), id)?;
-            // Also remove from live config
-            match app_type {
-                AppType::OpenCode => remove_opencode_provider_from_live(id)?,
-                AppType::OpenClaw => remove_openclaw_provider_from_live(id)?,
-                _ => {} // Should not reach here
-            }
             return Ok(());
         }
 
@@ -372,41 +2013,23 @@ impl ProviderService {
                     .get_provider_by_id(id, app_type.as_str())?
                     .and_then(|p| p.category);
 
-                if provider_category.as_deref() == Some("omo") {
+                let omo_variant = match provider_category.as_deref() {
+                    Some("omo") => Some(&crate::services::omo::STANDARD),
+                    Some("omo-slim") => Some(&crate::services::omo::SLIM),
+                    _ => None,
+                };
+                if let Some(variant) = omo_variant {
                     state
                         .db
-                        .clear_omo_provider_current(app_type.as_str(), id, "omo")?;
+                        .clear_omo_provider_current(app_type.as_str(), id, variant.category)?;
                     let still_has_current = state
                         .db
-                        .get_current_omo_provider("opencode", "omo")?
+                        .get_current_omo_provider("opencode", variant.category)?
                         .is_some();
                     if still_has_current {
-                        crate::services::OmoService::write_config_to_file(
-                            state,
-                            &crate::services::omo::STANDARD,
-                        )?;
+                        crate::services::OmoService::write_config_to_file(state, variant)?;
                     } else {
-                        crate::services::OmoService::delete_config_file(
-                            &crate::services::omo::STANDARD,
-                        )?;
-                    }
-                } else if provider_category.as_deref() == Some("omo-slim") {
-                    state
-                        .db
-                        .clear_omo_provider_current(app_type.as_str(), id, "omo-slim")?;
-                    let still_has_current = state
-                        .db
-                        .get_current_omo_provider("opencode", "omo-slim")?
-                        .is_some();
-                    if still_has_current {
-                        crate::services::OmoService::write_config_to_file(
-                            state,
-                            &crate::services::omo::SLIM,
-                        )?;
-                    } else {
-                        crate::services::OmoService::delete_config_file(
-                            &crate::services::omo::SLIM,
-                        )?;
+                        crate::services::OmoService::delete_config_file(variant)?;
                     }
                 } else {
                     remove_opencode_provider_from_live(id)?;
@@ -415,6 +2038,9 @@ impl ProviderService {
             AppType::OpenClaw => {
                 remove_openclaw_provider_from_live(id)?;
             }
+            AppType::Hermes => {
+                remove_hermes_provider_from_live(id)?;
+            }
             _ => {
                 return Err(AppError::Message(format!(
                     "App {} does not support remove from live config",
@@ -422,6 +2048,12 @@ impl ProviderService {
                 )));
             }
         }
+
+        if let Some(mut provider) = state.db.get_provider_by_id(id, app_type.as_str())? {
+            Self::set_provider_live_config_managed(&mut provider, false);
+            state.db.save_provider(app_type.as_str(), &provider)?;
+        }
+
         Ok(())
     }
 
@@ -430,7 +2062,7 @@ impl ProviderService {
     /// Switch flow:
     /// 1. Validate target provider exists
     /// 2. Check if proxy takeover mode is active AND proxy server is running
-    /// 3. If takeover mode active: hot-switch proxy target only (no Live config write)
+    /// 3. If takeover mode active: hot-switch proxy target and refresh proxy-safe Live labels
     /// 4. If normal mode:
     ///    a. **Backfill mechanism**: Backfill current live config to current provider
     ///    b. Update local settings current_provider_xxx (device-level)
@@ -456,59 +2088,66 @@ impl ProviderService {
             return Self::switch_normal(state, app_type, id, &providers);
         }
 
-        // Check if proxy takeover mode is active AND proxy server is actually running
-        // Both conditions must be true to use hot-switch mode
-        // Use blocking wait since this is a sync function
+        if matches!(app_type, AppType::ClaudeDesktop) {
+            return Self::switch_normal(state, app_type, id, &providers);
+        }
+
+        // Provider switches and takeover toggles both mutate live config and the
+        // restore backup. Serialize them per app, then decide from the locked
+        // current state so a just-started takeover cannot be overwritten by a
+        // normal live write.
+        let _switch_guard =
+            if matches!(app_type, AppType::Claude | AppType::Codex | AppType::Gemini) {
+                Some(futures::executor::block_on(
+                    state.proxy_service.lock_switch_for_app(app_type.as_str()),
+                ))
+            } else {
+                None
+            };
+
+        // Backup or live placeholders mean the live file is owned by proxy
+        // takeover, even if the proxy server is temporarily stopped or is in the
+        // activation window before enabled=true is committed.
         let is_app_taken_over =
             futures::executor::block_on(state.db.get_live_backup(app_type.as_str()))
                 .ok()
                 .flatten()
                 .is_some();
-        let is_proxy_running = futures::executor::block_on(state.proxy_service.is_running());
         let live_taken_over = state
             .proxy_service
             .detect_takeover_in_live_config_for_app(&app_type);
 
-        // Hot-switch only when BOTH: this app is taken over AND proxy server is actually running
-        let should_hot_switch = (is_app_taken_over || live_taken_over) && is_proxy_running;
+        let should_hot_switch = is_app_taken_over || live_taken_over;
+
+        // Block switching to official providers when proxy takeover is active.
+        // Using a proxy with official APIs (Anthropic/OpenAI/Google) may cause account bans.
+        if should_hot_switch && _provider.category.as_deref() == Some("official") {
+            return Err(AppError::localized(
+                "switch.official_blocked_by_proxy",
+                "代理接管模式下不能切换到官方供应商，使用代理访问官方 API 可能导致账号被封禁。请先关闭代理接管，或选择第三方供应商。",
+                "Cannot switch to official provider while proxy takeover is active. Using proxy with official APIs may cause account bans.",
+            ));
+        }
 
         if should_hot_switch {
-            // Proxy takeover mode: hot-switch only, don't write Live config
+            // Proxy takeover mode: hot-switch without restoring upstream Live config.
+            // The proxy layer may still refresh proxy-safe Live fields so client labels
+            // follow the selected provider while endpoints remain local.
             log::info!(
                 "代理接管模式：热切换 {} 的目标供应商为 {}",
                 app_type.as_str(),
                 id
             );
 
-            // 获取新供应商的完整配置（用于更新备份）
-            let provider = providers
-                .get(id)
-                .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
-
-            // Update database is_current
-            state.db.set_current_provider(app_type.as_str(), id)?;
-
-            // Update local settings for consistency
-            crate::settings::set_current_provider(&app_type, Some(id))?;
-
-            // 更新 Live 备份（确保代理关闭时恢复正确的供应商配置）
             futures::executor::block_on(
                 state
                     .proxy_service
-                    .update_live_backup_from_provider(app_type.as_str(), provider),
+                    .hot_switch_provider_inner(app_type.as_str(), id),
             )
-            .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
+            .map_err(|e| AppError::Message(format!("热切换失败: {e}")))?;
 
-            // 关键修复：接管模式下切换供应商不会写回 Live 配置，
-            // 需要主动清理 Claude Live 中的“模型覆盖”字段，避免仍以旧模型名发起请求。
-            if matches!(app_type, AppType::Claude) {
-                if let Err(e) = state.proxy_service.cleanup_claude_model_overrides_in_live() {
-                    log::warn!("清理 Claude Live 模型字段失败（不影响切换结果）: {e}");
-                }
-            }
-
-            // Note: No Live config write, no MCP sync
-            // The proxy server will route requests to the new provider via is_current
+            // The proxy server will route requests to the new provider via is_current.
+            // MCP sync is intentionally skipped while Live config is owned by takeover.
             return Ok(SwitchResult::default());
         }
 
@@ -527,29 +2166,23 @@ impl ProviderService {
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
 
-        if matches!(app_type, AppType::OpenCode) && provider.category.as_deref() == Some("omo") {
-            state
-                .db
-                .set_omo_provider_current(app_type.as_str(), id, "omo")?;
-            crate::services::OmoService::write_config_to_file(
-                state,
-                &crate::services::omo::STANDARD,
-            )?;
-            // OMO ↔ OMO Slim mutually exclusive: remove Slim config
-            let _ = crate::services::OmoService::delete_config_file(&crate::services::omo::SLIM);
-            return Ok(SwitchResult::default());
-        }
-
-        if matches!(app_type, AppType::OpenCode) && provider.category.as_deref() == Some("omo-slim")
-        {
-            state
-                .db
-                .set_omo_provider_current(app_type.as_str(), id, "omo-slim")?;
-            crate::services::OmoService::write_config_to_file(state, &crate::services::omo::SLIM)?;
-            // OMO ↔ OMO Slim mutually exclusive: remove Standard config
-            let _ =
-                crate::services::OmoService::delete_config_file(&crate::services::omo::STANDARD);
-            return Ok(SwitchResult::default());
+        // OMO ↔ OMO Slim are mutually exclusive; activating one removes the other's config file.
+        if matches!(app_type, AppType::OpenCode) {
+            let omo_pair = match provider.category.as_deref() {
+                Some("omo") => Some((&crate::services::omo::STANDARD, &crate::services::omo::SLIM)),
+                Some("omo-slim") => {
+                    Some((&crate::services::omo::SLIM, &crate::services::omo::STANDARD))
+                }
+                _ => None,
+            };
+            if let Some((enable, disable)) = omo_pair {
+                state
+                    .db
+                    .set_omo_provider_current(app_type.as_str(), id, enable.category)?;
+                crate::services::OmoService::write_config_to_file(state, enable)?;
+                let _ = crate::services::OmoService::delete_config_file(disable);
+                return Ok(SwitchResult::default());
+            }
         }
 
         let mut result = SwitchResult::default();
@@ -566,6 +2199,17 @@ impl ProviderService {
                     // Only backfill when switching to a different provider
                     if let Ok(live_config) = read_live_settings(app_type.clone()) {
                         if let Some(mut current_provider) = providers.get(&current_id).cloned() {
+                            // 切走前先把 live 里的可共享改动（含用户直接在应用内
+                            // 装插件/加 hook/改偏好）同步进通用配置片段，再做剥离回填。
+                            // 详见 sync_common_config_snippet_from_live 的文档。
+                            Self::sync_common_config_snippet_from_live(
+                                state,
+                                &app_type,
+                                &current_provider,
+                                &live_config,
+                                &mut result,
+                            );
+
                             current_provider.settings_config =
                                 strip_common_config_from_live_settings(
                                     state.db.as_ref(),
@@ -599,6 +2243,60 @@ impl ProviderService {
         // Sync to live (write_gemini_live handles security flag internally for Gemini)
         write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
 
+        // Hermes is additive, so "switching" doesn't overwrite a live config file
+        // — we instead update the top-level `model:` section to point at this
+        // provider's first declared model. Without this, clicking "switch" would
+        // only shuffle entries in custom_providers[] while Hermes keeps using
+        // whatever `model.provider` was set before.
+        if matches!(app_type, AppType::Hermes) {
+            if let Err(e) =
+                crate::hermes_config::apply_switch_defaults(&provider.id, &provider.settings_config)
+            {
+                log::warn!(
+                    "Failed to update Hermes model defaults after switching to '{}': {e}",
+                    provider.id
+                );
+                result
+                    .warnings
+                    .push(format!("hermes_model_defaults_failed:{}", provider.id));
+            }
+        }
+
+        // For additive-mode providers that were DB-only (live_config_managed == Some(false)),
+        // flip the flag to true now that the provider has been successfully written to the live
+        // file. This ensures sync_all_providers_to_live() will include it on future syncs.
+        //
+        // If persisting the marker fails, roll back the just-written live config so we don't leave
+        // the provider in a silent inconsistent state (present in live, but still marked DB-only).
+        if app_type.is_additive_mode() && Self::provider_live_config_managed(provider) != Some(true)
+        {
+            let mut updated = provider.clone();
+            Self::set_provider_live_config_managed(&mut updated, true);
+            if let Err(e) = state.db.save_provider(app_type.as_str(), &updated) {
+                let rollback_result = match app_type {
+                    AppType::OpenCode => remove_opencode_provider_from_live(&provider.id),
+                    AppType::OpenClaw => remove_openclaw_provider_from_live(&provider.id),
+                    AppType::Hermes => remove_hermes_provider_from_live(&provider.id),
+                    _ => Ok(()),
+                };
+
+                match rollback_result {
+                    Ok(()) => {
+                        return Err(AppError::Message(format!(
+                            "Failed to persist live_config_managed for '{}' after writing live config; live changes were rolled back: {e}",
+                            provider.id
+                        )));
+                    }
+                    Err(rollback_err) => {
+                        return Err(AppError::Message(format!(
+                            "Failed to persist live_config_managed for '{}' after writing live config: {e}; additionally failed to roll back live config: {rollback_err}",
+                            provider.id
+                        )));
+                    }
+                }
+            }
+        }
+
         // Sync MCP
         McpService::sync_all_enabled(state)?;
 
@@ -629,11 +2327,6 @@ impl ProviderService {
             return Ok(());
         };
 
-        let takeover_enabled =
-            futures::executor::block_on(state.db.get_proxy_config_for_app(app_type.as_str()))
-                .map(|config| config.enabled)
-                .unwrap_or(false);
-
         let has_live_backup =
             futures::executor::block_on(state.db.get_live_backup(app_type.as_str()))
                 .ok()
@@ -644,7 +2337,14 @@ impl ProviderService {
             .proxy_service
             .detect_takeover_in_live_config_for_app(&app_type);
 
-        if takeover_enabled && (has_live_backup || live_taken_over) {
+        // See the save path above: backup/placeholders are the ownership signal
+        // here, not just proxy_config.enabled.
+        if has_live_backup || live_taken_over {
+            if matches!(app_type, AppType::ClaudeDesktop) {
+                write_live_with_common_config(state.db.as_ref(), &app_type, provider)?;
+                return Ok(());
+            }
+
             futures::executor::block_on(
                 state
                     .proxy_service
@@ -730,6 +2430,100 @@ impl ProviderService {
         Self::migrate_legacy_common_config_usage(state, app_type, &snippet)
     }
 
+    /// 切走某供应商前，把它 live 配置里的可共享部分重新提取并**整体替换**到
+    /// 通用配置片段，使在 live 应用里直接做的改动不会因切换而丢失。
+    ///
+    /// 采用"整体重提取 + 替换"而非"只合并新增"，是为了同时覆盖三种情况：
+    /// - **新增**：用户直接在应用里装了插件、加了 hook、改了 env/主题/权限等共享
+    ///   偏好，被捕获进通用配置，切到别的供应商也带得过去；
+    /// - **删除**：被删掉的键不在新提取结果里，于是从片段里消失、下次切换不会被
+    ///   重新注入——否则会出现"插件怎么删也删不掉"的反直觉 bug；
+    /// - **密钥安全**：提取器已剥掉 auth / model / endpoint，密钥永不进共享片段。
+    ///
+    /// 之所以"整体替换"是安全的：每次写 live 都会把当前片段合并进去，所以切走时
+    /// 读到的 live 一定是"片段 + 本地改动"的超集，重提取只会丢掉用户真正删掉的键，
+    /// 不会误删其它供应商共享的内容。
+    ///
+    /// **作用域**：仅 Claude。Codex 的 live 是 TOML 且端点藏在 `[model_providers]`
+    /// 表里（现有提取器不剥），自动同步会泄漏端点并与 modelCatalog / 统一会话桶 /
+    /// auth 还原逻辑冲突；Gemini 暂未纳入。两者如需支持应各自单独验证后再加。
+    ///
+    /// 仅对**显式勾选"写入通用配置"**（`meta.common_config_enabled == Some(true)`）的
+    /// 供应商生效；用户**显式清空**过片段（`_cleared`）时跳过，避免把用户主动清掉的
+    /// 配置又塞回来。所有失败均为非致命，只记 warning，绝不阻断切换。
+    fn sync_common_config_snippet_from_live(
+        state: &AppState,
+        app_type: &AppType,
+        provider: &Provider,
+        live_config: &Value,
+        result: &mut SwitchResult,
+    ) {
+        // 作用域限定 Claude（见函数文档）。
+        if !matches!(app_type, AppType::Claude) {
+            return;
+        }
+
+        let opted_in = provider
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.common_config_enabled)
+            == Some(true);
+        if !opted_in {
+            return;
+        }
+
+        match state.db.is_config_snippet_cleared(app_type.as_str()) {
+            Ok(true) => return, // 用户显式清空过通用配置，尊重其选择，不再自动塞回
+            Ok(false) => {}
+            Err(err) => {
+                log::warn!(
+                    "Failed to read common config cleared flag for {}: {err}",
+                    app_type.as_str()
+                );
+                return;
+            }
+        }
+
+        let new_snippet = match Self::extract_common_config_snippet_from_settings(
+            app_type.clone(),
+            live_config,
+        ) {
+            Ok(snippet) => snippet,
+            Err(err) => {
+                log::warn!(
+                    "Failed to extract common config from live for {} provider '{}': {err}",
+                    app_type.as_str(),
+                    provider.id
+                );
+                return;
+            }
+        };
+
+        // 未变化则跳过，避免无谓写库（不切 live 配置时这是常态路径）。
+        let current = state
+            .db
+            .get_config_snippet(app_type.as_str())
+            .ok()
+            .flatten();
+        if current.as_deref() == Some(new_snippet.as_str()) {
+            return;
+        }
+
+        if let Err(err) = state
+            .db
+            .set_config_snippet(app_type.as_str(), Some(new_snippet))
+        {
+            log::warn!(
+                "Failed to persist synced common config for {} provider '{}': {err}",
+                app_type.as_str(),
+                provider.id
+            );
+            result
+                .warnings
+                .push(format!("common_config_sync_failed:{}", provider.id));
+        }
+    }
+
     /// Extract common config snippet from current provider
     ///
     /// Extracts the current provider's configuration and removes provider-specific fields
@@ -751,10 +2545,12 @@ impl ProviderService {
 
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(&provider.settings_config),
+            AppType::ClaudeDesktop => Ok(String::new()),
             AppType::Codex => Self::extract_codex_common_config(&provider.settings_config),
             AppType::Gemini => Self::extract_gemini_common_config(&provider.settings_config),
             AppType::OpenCode => Self::extract_opencode_common_config(&provider.settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(&provider.settings_config),
+            AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
         }
     }
 
@@ -765,29 +2561,80 @@ impl ProviderService {
     ) -> Result<String, AppError> {
         match app_type {
             AppType::Claude => Self::extract_claude_common_config(settings_config),
+            AppType::ClaudeDesktop => Ok(String::new()),
             AppType::Codex => Self::extract_codex_common_config(settings_config),
             AppType::Gemini => Self::extract_gemini_common_config(settings_config),
             AppType::OpenCode => Self::extract_opencode_common_config(settings_config),
             AppType::OpenClaw => Self::extract_openclaw_common_config(settings_config),
+            AppType::Hermes => Ok(String::new()), // Hermes doesn't use common config snippets
         }
+    }
+
+    /// 判断一个 env / 顶层配置键名是否为凭据/机密：凡命中一律不得写入共享的
+    /// 通用配置片段。**故意从严**——多剥一个非机密键只是它不被共享（可恢复的小
+    /// 不便），漏剥一个凭据则会把密钥注入到每个供应商（不可恢复的泄漏）。因此用
+    /// 模式匹配覆盖整类，而非枚举具体名字（枚举永远会漏掉下一个 `*_API_KEY`）。
+    ///
+    /// 覆盖：Anthropic / OpenRouter / Google / OpenAI / Gemini 等 `*_API_KEY`
+    /// （Claude provider 的凭据见 `Provider::resolve_usage_credentials`，确实支持
+    /// `OPENROUTER_API_KEY` / `GOOGLE_API_KEY` 等回退）、各类 `*_AUTH_TOKEN` /
+    /// 单数 `*_TOKEN`、AWS Bedrock / Vertex 凭据、以及通用 secret / password /
+    /// 私钥命名。
+    fn is_sensitive_config_key(name: &str) -> bool {
+        let upper = name.to_ascii_uppercase();
+
+        // 单数 `_TOKEN` 命中 AWS_SESSION_TOKEN 等，但**不**误伤复数 `_TOKENS`
+        // （CLAUDE_CODE_MAX_OUTPUT_TOKENS / MAX_THINKING_TOKENS 是正常可共享配置）。
+        const SENSITIVE_SUFFIXES: &[&str] = &[
+            "_API_KEY",
+            "_APIKEY",
+            "_AUTH_TOKEN",
+            "_TOKEN",
+            "_ACCESS_KEY",
+            "_ACCESS_KEY_ID",
+            "_KEY_ID",
+            "_PRIVATE_KEY",
+        ];
+        const SENSITIVE_EXACT: &[&str] = &[
+            "APIKEY",
+            "API_KEY",
+            "TOKEN",
+            "SECRET",
+            "PASSWORD",
+            "CREDENTIALS",
+        ];
+        // contains：覆盖 AWS_SECRET_ACCESS_KEY / *_CLIENT_SECRET /
+        // GOOGLE_APPLICATION_CREDENTIALS / AWS_BEARER_TOKEN_BEDROCK 等变体。
+        const SENSITIVE_CONTAINS: &[&str] = &[
+            "SECRET",
+            "PASSWORD",
+            "PASSWD",
+            "CREDENTIAL",
+            "PRIVATE_KEY",
+            "BEARER_TOKEN",
+        ];
+
+        SENSITIVE_EXACT.contains(&upper.as_str())
+            || SENSITIVE_SUFFIXES.iter().any(|s| upper.ends_with(s))
+            || SENSITIVE_CONTAINS.iter().any(|c| upper.contains(c))
     }
 
     /// Extract common config for Claude (JSON format)
     fn extract_claude_common_config(settings: &Value) -> Result<String, AppError> {
         let mut config = settings.clone();
 
-        // Fields to exclude from common config
-        const ENV_EXCLUDES: &[&str] = &[
-            // Auth
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            // Models (5 fields)
+        // 供应商专属的**非机密**字段（模型 + 端点），不应共享。凭据/机密不在此列举，
+        // 改由 `is_sensitive_config_key`（模式匹配）统一剥离，新供应商的 `*_API_KEY`
+        // 等无需再手工补名单即可被覆盖。
+        const ENV_PROVIDER_SPECIFIC_EXCLUDES: &[&str] = &[
             "ANTHROPIC_MODEL",
-            "ANTHROPIC_REASONING_MODEL",
+            "ANTHROPIC_REASONING_MODEL", // legacy: 已废弃，但旧配置可能残留
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
-            // Endpoint
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
             "ANTHROPIC_BASE_URL",
         ];
 
@@ -798,10 +2645,18 @@ impl ProviderService {
             "smallFastModel",
         ];
 
-        // Remove env fields
+        // Remove env fields: provider-specific (models/endpoint) + 任何凭据键。
         if let Some(env) = config.get_mut("env").and_then(|v| v.as_object_mut()) {
-            for key in ENV_EXCLUDES {
+            let sensitive: Vec<String> = env
+                .keys()
+                .filter(|k| Self::is_sensitive_config_key(k))
+                .cloned()
+                .collect();
+            for key in ENV_PROVIDER_SPECIFIC_EXCLUDES {
                 env.remove(*key);
+            }
+            for key in &sensitive {
+                env.remove(key);
             }
             // If env is empty after removal, remove the env object itself
             if env.is_empty() {
@@ -809,10 +2664,19 @@ impl ProviderService {
             }
         }
 
-        // Remove top-level fields
+        // Remove top-level fields: legacy model fields + 任何凭据键
+        // （例如非标准的顶层 apiKey / api_key / *_TOKEN）。
         if let Some(obj) = config.as_object_mut() {
+            let sensitive: Vec<String> = obj
+                .keys()
+                .filter(|k| Self::is_sensitive_config_key(k))
+                .cloned()
+                .collect();
             for key in TOP_LEVEL_EXCLUDES {
                 obj.remove(*key);
+            }
+            for key in &sensitive {
+                obj.remove(key);
             }
         }
 
@@ -953,6 +2817,13 @@ impl ProviderService {
         import_default_config(state, app_type)
     }
 
+    pub fn should_import_default_config_on_startup(
+        state: &AppState,
+        app_type: &AppType,
+    ) -> Result<bool, AppError> {
+        should_import_default_config_on_startup(state, app_type)
+    }
+
     /// Read current live settings (re-export)
     pub fn read_live_settings(app_type: AppType) -> Result<Value, AppError> {
         read_live_settings(app_type)
@@ -1068,6 +2939,9 @@ impl ProviderService {
                     ));
                 }
             }
+            AppType::ClaudeDesktop => {
+                crate::claude_desktop_config::validate_provider(provider)?;
+            }
             AppType::Codex => {
                 let settings = provider.settings_config.as_object().ok_or_else(|| {
                     AppError::localized(
@@ -1134,10 +3008,26 @@ impl ProviderService {
                     ));
                 }
             }
+            AppType::Hermes => {
+                // Hermes: accept any JSON object for now
+                if !provider.settings_config.is_object() {
+                    return Err(AppError::localized(
+                        "provider.hermes.settings.not_object",
+                        "Hermes 配置必须是 JSON 对象",
+                        "Hermes configuration must be a JSON object",
+                    ));
+                }
+            }
         }
 
         // Validate and clean UsageScript configuration (common for all app types)
         if let Some(meta) = &provider.meta {
+            if let Some(multiplier) = meta.cost_multiplier.as_deref() {
+                validate_cost_multiplier(multiplier)?;
+            }
+            if let Some(source) = meta.pricing_model_source.as_deref() {
+                validate_pricing_source(source)?;
+            }
             if let Some(usage_script) = &meta.usage_script {
                 validate_usage_script(usage_script)?;
             }
@@ -1192,8 +3082,13 @@ impl ProviderService {
 
                 Ok((api_key, base_url))
             }
+            AppType::ClaudeDesktop => {
+                let credentials =
+                    crate::claude_desktop_config::direct_gateway_credentials(provider)?;
+                Ok((credentials.api_key, credentials.base_url))
+            }
             AppType::Codex => {
-                let auth = provider
+                let _auth = provider
                     .settings_config
                     .get("auth")
                     .and_then(|v| v.as_object())
@@ -1205,23 +3100,23 @@ impl ProviderService {
                         )
                     })?;
 
-                let api_key = auth
-                    .get("OPENAI_API_KEY")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        AppError::localized(
-                            "provider.codex.api_key.missing",
-                            "缺少 API Key",
-                            "API key is missing",
-                        )
-                    })?
-                    .to_string();
-
                 let config_toml = provider
                     .settings_config
                     .get("config")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+
+                let api_key = crate::codex_config::extract_codex_api_key(
+                    provider.settings_config.get("auth"),
+                    Some(config_toml),
+                )
+                .ok_or_else(|| {
+                    AppError::localized(
+                        "provider.codex.api_key.missing",
+                        "缺少 API Key",
+                        "API key is missing",
+                    )
+                })?;
 
                 let base_url = if config_toml.contains("base_url") {
                     let re = Regex::new(r#"base_url\s*=\s*["']([^"']+)["']"#).map_err(|e| {
@@ -1305,8 +3200,8 @@ impl ProviderService {
 
                 Ok((api_key, base_url))
             }
-            AppType::OpenClaw => {
-                // OpenClaw uses apiKey and baseUrl directly on the object
+            AppType::OpenClaw | AppType::Hermes => {
+                // OpenClaw/Hermes use apiKey and baseUrl directly on the object
                 let api_key = provider
                     .settings_config
                     .get("apiKey")

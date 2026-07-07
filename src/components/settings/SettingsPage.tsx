@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { motion } from "framer-motion";
 import {
   Loader2,
@@ -31,6 +38,7 @@ import { LanguageSettings } from "@/components/settings/LanguageSettings";
 import { ThemeSettings } from "@/components/settings/ThemeSettings";
 import { WindowSettings } from "@/components/settings/WindowSettings";
 import { AppVisibilitySettings } from "@/components/settings/AppVisibilitySettings";
+import { SkillStorageLocationSettings } from "@/components/settings/SkillStorageLocationSettings";
 import { SkillSyncMethodSettings } from "@/components/settings/SkillSyncMethodSettings";
 import { TerminalSettings } from "@/components/settings/TerminalSettings";
 import { DirectorySettings } from "@/components/settings/DirectorySettings";
@@ -42,6 +50,9 @@ import { ProxyTabContent } from "@/components/settings/ProxyTabContent";
 import { ModelTestConfigPanel } from "@/components/usage/ModelTestConfigPanel";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
 import { LogConfigPanel } from "@/components/settings/LogConfigPanel";
+import { AuthCenterPanel } from "@/components/settings/AuthCenterPanel";
+import { CodexAuthSettings } from "@/components/settings/CodexAuthSettings";
+import { useInstalledSkills } from "@/hooks/useSkills";
 import { useSettings } from "@/hooks/useSettings";
 import { useImportExport } from "@/hooks/useImportExport";
 import { useTranslation } from "react-i18next";
@@ -94,8 +105,11 @@ export function SettingsPage({
     resetStatus,
   } = useImportExport({ onImportSuccess });
 
+  const { data: installedSkills } = useInstalledSkills();
+
   const [activeTab, setActiveTab] = useState<string>("general");
   const [showRestartPrompt, setShowRestartPrompt] = useState(false);
+  const tabScrollContainerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) {
@@ -109,6 +123,12 @@ export function SettingsPage({
       setShowRestartPrompt(true);
     }
   }, [requiresRestart]);
+
+  useLayoutEffect(() => {
+    if (tabScrollContainerRef.current) {
+      tabScrollContainerRef.current.scrollTop = 0;
+    }
+  }, [activeTab]);
 
   const closeAfterSave = useCallback(() => {
     // 保存成功后关闭：不再重置语言，避免需要“保存两次”才生效
@@ -157,19 +177,34 @@ export function SettingsPage({
 
   // 通用设置即时保存（无需手动点击）
   // 使用 autoSaveSettings 避免误触发系统 API（开机自启、Claude 插件等）
+  // 返回保存是否成功：需要在保存成功后追加动作的调用方（如统一会话历史
+  // 关闭后的备份还原）据此短路，其余调用方可忽略返回值。
   const handleAutoSave = useCallback(
-    async (updates: Partial<SettingsFormState>) => {
-      if (!settings) return;
+    async (updates: Partial<SettingsFormState>): Promise<boolean> => {
+      if (!settings) return false;
+      // 乐观更新前捕获旧值：autoSaveSettings 发送的是全量表单状态，后端按
+      // diff 触发副作用（如统一会话开关的 live 重写与历史迁移）。保存失败
+      // 不回滚的话，失败的变更会滞留在表单里，被之后任意一次无关保存原样
+      // 重放，绕过确认弹窗。
+      const previousValues = Object.fromEntries(
+        Object.keys(updates).map((key) => [
+          key,
+          settings[key as keyof SettingsFormState],
+        ]),
+      ) as Partial<SettingsFormState>;
       updateSettings(updates);
       try {
         await autoSaveSettings(updates);
+        return true;
       } catch (error) {
         console.error("[SettingsPage] Failed to autosave settings", error);
+        updateSettings(previousValues);
         toast.error(
           t("settings.saveFailedGeneric", {
             defaultValue: "保存失败，请重试",
           }),
         );
+        return false;
       }
     },
     [autoSaveSettings, settings, t, updateSettings],
@@ -189,11 +224,14 @@ export function SettingsPage({
           onValueChange={setActiveTab}
           className="flex flex-col h-full"
         >
-          <TabsList className="grid w-full grid-cols-5 mb-6 glass rounded-lg">
+          <TabsList className="grid w-full grid-cols-6 mb-6 glass rounded-lg">
             <TabsTrigger value="general">
               {t("settings.tabGeneral")}
             </TabsTrigger>
             <TabsTrigger value="proxy">{t("settings.tabProxy")}</TabsTrigger>
+            <TabsTrigger value="auth">
+              {t("settings.tabAuth", { defaultValue: "认证" })}
+            </TabsTrigger>
             <TabsTrigger value="advanced">
               {t("settings.tabAdvanced")}
             </TabsTrigger>
@@ -202,7 +240,10 @@ export function SettingsPage({
           </TabsList>
 
           <div className="flex-1 min-h-0 flex flex-col">
-            <div className="flex-1 overflow-y-auto overflow-x-hidden pr-2">
+            <div
+              ref={tabScrollContainerRef}
+              className="flex-1 overflow-y-auto overflow-x-hidden pr-2"
+            >
               <TabsContent value="general" className="space-y-6 mt-0">
                 {settings ? (
                   <motion.div
@@ -220,15 +261,26 @@ export function SettingsPage({
                       settings={settings}
                       onChange={handleAutoSave}
                     />
-                    <WindowSettings
-                      settings={settings}
-                      onChange={handleAutoSave}
+                    <SkillStorageLocationSettings
+                      value={settings.skillStorageLocation ?? "cc_switch"}
+                      installedCount={installedSkills?.length ?? 0}
+                      onMigrated={(location) =>
+                        updateSettings({ skillStorageLocation: location })
+                      }
                     />
                     <SkillSyncMethodSettings
                       value={settings.skillSyncMethod ?? "auto"}
                       onChange={(method) =>
                         handleAutoSave({ skillSyncMethod: method })
                       }
+                    />
+                    <CodexAuthSettings
+                      settings={settings}
+                      onChange={handleAutoSave}
+                    />
+                    <WindowSettings
+                      settings={settings}
+                      onChange={handleAutoSave}
                     />
                     <TerminalSettings
                       value={settings.preferredTerminal}
@@ -247,6 +299,17 @@ export function SettingsPage({
                     onAutoSave={handleAutoSave}
                   />
                 ) : null}
+              </TabsContent>
+
+              <TabsContent value="auth" className="space-y-6 mt-0 pb-4">
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.3 }}
+                  className="space-y-6"
+                >
+                  <AuthCenterPanel />
+                </motion.div>
               </TabsContent>
 
               <TabsContent value="advanced" className="space-y-6 mt-0 pb-4">
@@ -290,6 +353,8 @@ export function SettingsPage({
                             codexDir={settings.codexConfigDir}
                             geminiDir={settings.geminiConfigDir}
                             opencodeDir={settings.opencodeConfigDir}
+                            openclawDir={settings.openclawConfigDir}
+                            hermesDir={settings.hermesConfigDir}
                             onDirectoryChange={updateDirectory}
                             onBrowseDirectory={browseDirectory}
                             onResetDirectory={resetDirectory}
@@ -382,6 +447,7 @@ export function SettingsPage({
                         <AccordionContent className="px-6 pb-6 pt-4 border-t border-border/50">
                           <WebdavSyncSection
                             config={settings?.webdavSync}
+                            s3Config={settings?.s3Sync}
                             settings={settings}
                             onAutoSave={handleAutoSave}
                           />
@@ -447,7 +513,7 @@ export function SettingsPage({
 
             {activeTab === "advanced" && settings && (
               <div
-                className="flex-shrink-0 py-4 border-t border-border-default"
+                className="flex-shrink-0 pt-4 border-t border-border-default"
                 style={{ backgroundColor: "hsl(var(--background))" }}
               >
                 <div className="px-6 flex items-center justify-end gap-3">

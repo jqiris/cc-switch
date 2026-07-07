@@ -10,20 +10,30 @@ import type {
   OpenClawDefaultModel,
 } from "@/types";
 import type { OpenClawSuggestedDefaults } from "@/config/openclawProviderPresets";
+import { injectCodingPlanUsageScript } from "@/config/codingPlanProviders";
 import {
   useAddProviderMutation,
   useUpdateProviderMutation,
   useDeleteProviderMutation,
   useSwitchProviderMutation,
 } from "@/lib/query";
+import { usageKeys } from "@/lib/query/usage";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { openclawKeys } from "@/hooks/useOpenClaw";
+import {
+  extractCodexWireApi,
+  isCodexChatWireApi,
+} from "@/utils/providerConfigUtils";
 
 /**
  * Hook for managing provider actions (add, update, delete, switch)
  * Extracts business logic from App.tsx
  */
-export function useProviderActions(activeApp: AppId) {
+export function useProviderActions(
+  activeApp: AppId,
+  isProxyRunning?: boolean,
+  isProxyTakeover?: boolean,
+) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
@@ -65,9 +75,12 @@ export function useProviderActions(activeApp: AppId) {
       provider: Omit<Provider, "id"> & {
         providerKey?: string;
         suggestedDefaults?: OpenClawSuggestedDefaults;
+        addToLive?: boolean;
+        ensureClaudeDesktopOfficialSeed?: boolean;
       },
     ) => {
-      await addProviderMutation.mutateAsync(provider);
+      const enhanced = injectCodingPlanUsageScript(activeApp, provider);
+      await addProviderMutation.mutateAsync(enhanced);
 
       // OpenClaw: register models to allowlist after adding provider
       if (activeApp === "openclaw" && provider.suggestedDefaults) {
@@ -120,8 +133,8 @@ export function useProviderActions(activeApp: AppId) {
 
   // 更新供应商
   const updateProvider = useCallback(
-    async (provider: Provider) => {
-      await updateProviderMutation.mutateAsync(provider);
+    async (provider: Provider, originalId?: string) => {
+      await updateProviderMutation.mutateAsync({ provider, originalId });
 
       // 更新托盘菜单（失败不影响主操作）
       try {
@@ -139,6 +152,84 @@ export function useProviderActions(activeApp: AppId) {
   // 切换供应商
   const switchProvider = useCallback(
     async (provider: Provider) => {
+      const isCopilotProvider =
+        activeApp === "claude" &&
+        provider.meta?.providerType === "github_copilot";
+      const isCodexChatFormat =
+        activeApp === "codex" &&
+        (provider.meta?.apiFormat === "openai_chat" ||
+          (typeof (provider.settingsConfig as Record<string, any>)?.config ===
+            "string" &&
+            isCodexChatWireApi(
+              extractCodexWireApi(
+                (provider.settingsConfig as Record<string, any>).config,
+              ),
+            )));
+
+      // Determine why this provider requires the proxy
+      let proxyRequiredReason: string | null = null;
+      if (!isProxyRunning && provider.category !== "official") {
+        if (isCopilotProvider) {
+          proxyRequiredReason = t("notifications.proxyReasonCopilot", {
+            defaultValue: "使用 GitHub Copilot 作为 Claude 供应商",
+          });
+        } else if (
+          provider.meta?.apiFormat === "openai_chat" &&
+          activeApp === "claude"
+        ) {
+          proxyRequiredReason = t("notifications.proxyReasonOpenAIChat", {
+            defaultValue: "使用 OpenAI Chat 接口格式",
+          });
+        } else if (
+          provider.meta?.apiFormat === "openai_responses" &&
+          activeApp === "claude"
+        ) {
+          proxyRequiredReason = t("notifications.proxyReasonOpenAIResponses", {
+            defaultValue: "使用 OpenAI Responses 接口格式",
+          });
+        } else if (isCodexChatFormat) {
+          proxyRequiredReason = t("notifications.proxyReasonOpenAIChat", {
+            defaultValue: "使用 OpenAI Chat 接口格式",
+          });
+        } else if (
+          activeApp === "claude-desktop" &&
+          provider.meta?.claudeDesktopMode === "proxy"
+        ) {
+          proxyRequiredReason = t("notifications.proxyReasonClaudeDesktop", {
+            defaultValue: "使用 Claude Desktop 本地路由模式",
+          });
+        } else if (
+          provider.meta?.isFullUrl &&
+          (activeApp === "claude" || activeApp === "codex")
+        ) {
+          proxyRequiredReason = t("notifications.proxyReasonFullUrl", {
+            defaultValue: "开启了完整 URL 连接模式",
+          });
+        }
+      }
+
+      if (proxyRequiredReason) {
+        toast.warning(
+          t("notifications.proxyRequiredForSwitch", {
+            reason: proxyRequiredReason,
+            defaultValue:
+              "此供应商{{reason}}，需要代理服务才能正常使用，请先启动代理",
+          }),
+        );
+      }
+
+      // Block official providers when proxy takeover is active
+      if (isProxyTakeover && provider.category === "official") {
+        toast.error(
+          t("notifications.officialBlockedByProxy", {
+            defaultValue:
+              "代理接管模式下不能切换到官方供应商，使用代理访问官方 API 可能导致账号被封禁",
+          }),
+          { duration: 6000 },
+        );
+        return;
+      }
+
       try {
         const result = await switchProviderMutation.mutateAsync(provider.id);
         await syncClaudePlugin(provider);
@@ -154,36 +245,26 @@ export function useProviderActions(activeApp: AppId) {
           );
         }
 
-        // 根据供应商类型显示不同的成功提示
-        if (
-          activeApp === "claude" &&
-          provider.category !== "official" &&
-          (provider.meta?.apiFormat === "openai_chat" ||
-            provider.meta?.apiFormat === "openai_responses")
-        ) {
-          // OpenAI format provider: show proxy hint
-          toast.info(
-            t("notifications.openAIFormatHint", {
-              defaultValue:
-                "此供应商使用 OpenAI 兼容格式，需要开启代理服务才能正常使用",
-            }),
-            {
-              duration: 5000,
-              closeButton: true,
-            },
-          );
-        } else {
-          // 普通供应商：显示切换成功
-          // OpenCode/OpenClaw: show "added to config" message instead of "switched"
-          const isMultiProviderApp =
-            activeApp === "opencode" || activeApp === "openclaw";
-          const messageKey = isMultiProviderApp
-            ? "notifications.addToConfigSuccess"
-            : "notifications.switchSuccess";
-          const defaultMessage = isMultiProviderApp
-            ? "已添加到配置"
-            : "切换成功！";
-
+        // 若已弹过 proxyRequired 警告则不再弹 success
+        if (!proxyRequiredReason) {
+          let messageKey = "notifications.switchSuccess";
+          let defaultMessage = "切换成功！";
+          if (activeApp === "codex") {
+            messageKey = "notifications.codexRestartRequired";
+            defaultMessage = "切换成功，请重启客户端以生效";
+          } else if (activeApp === "claude-desktop") {
+            if (provider.meta?.claudeDesktopMode === "proxy") {
+              messageKey = "notifications.claudeDesktopProxyRestartRequired";
+              defaultMessage =
+                "切换成功，请保持 CC Switch 运行，并重启 Claude Desktop 后生效";
+            } else {
+              messageKey = "notifications.claudeDesktopRestartRequired";
+              defaultMessage = "切换成功，重启 Claude Desktop 后生效";
+            }
+          } else if (activeApp === "opencode" || activeApp === "openclaw") {
+            messageKey = "notifications.addToConfigSuccess";
+            defaultMessage = "已添加到配置";
+          }
           toast.success(t(messageKey, { defaultValue: defaultMessage }), {
             closeButton: true,
           });
@@ -192,7 +273,14 @@ export function useProviderActions(activeApp: AppId) {
         // 错误提示由 mutation 处理
       }
     },
-    [switchProviderMutation, syncClaudePlugin, activeApp, t],
+    [
+      switchProviderMutation,
+      syncClaudePlugin,
+      activeApp,
+      isProxyRunning,
+      isProxyTakeover,
+      t,
+    ],
   );
 
   // 删除供应商
@@ -222,7 +310,10 @@ export function useProviderActions(activeApp: AppId) {
         // 🔧 保存用量脚本后，也应该失效该 provider 的用量查询缓存
         // 这样主页列表会使用新配置重新查询，而不是使用测试时的缓存
         await queryClient.invalidateQueries({
-          queryKey: ["usage", provider.id, activeApp],
+          queryKey: usageKeys.script(provider.id, activeApp),
+        });
+        await queryClient.invalidateQueries({
+          queryKey: ["subscription", "quota", activeApp],
         });
         toast.success(
           t("provider.usageSaved", {

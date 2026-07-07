@@ -6,18 +6,78 @@ use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
 
+const STANDARD_OMO_PLUGIN_PREFIXES: [&str; 2] = ["oh-my-openagent", "oh-my-opencode"];
+const SLIM_OMO_PLUGIN_PREFIXES: [&str; 1] = ["oh-my-opencode-slim"];
+
+fn matches_plugin_prefix(plugin_name: &str, prefix: &str) -> bool {
+    plugin_name == prefix
+        || plugin_name
+            .strip_prefix(prefix)
+            .map(|suffix| suffix.starts_with('@'))
+            .unwrap_or(false)
+}
+
+fn matches_any_plugin_prefix(plugin_name: &str, prefixes: &[&str]) -> bool {
+    prefixes
+        .iter()
+        .any(|prefix| matches_plugin_prefix(plugin_name, prefix))
+}
+
+fn canonicalize_plugin_name(plugin_name: &str) -> String {
+    if let Some(suffix) = plugin_name.strip_prefix("oh-my-opencode") {
+        if suffix.is_empty() || suffix.starts_with('@') {
+            return format!("oh-my-openagent{suffix}");
+        }
+    }
+    plugin_name.to_string()
+}
+
 pub fn get_opencode_dir() -> PathBuf {
     if let Some(override_dir) = get_opencode_override_dir() {
         return override_dir;
     }
 
-    dirs::home_dir()
-        .map(|h| h.join(".config").join("opencode"))
-        .unwrap_or_else(|| PathBuf::from(".config").join("opencode"))
+    crate::config::get_home_dir()
+        .join(".config")
+        .join("opencode")
 }
 
 pub fn get_opencode_config_path() -> PathBuf {
     get_opencode_dir().join("opencode.json")
+}
+
+/// 获取 OpenCode SQLite 数据库路径
+/// 优先级: OPENCODE_DB 环境变量 > XDG_DATA_HOME > ~/.local/share/opencode
+pub fn get_opencode_db_path() -> PathBuf {
+    // 支持 OPENCODE_DB 环境变量覆盖（忽略空字符串）
+    if let Ok(custom_path) = std::env::var("OPENCODE_DB") {
+        if !custom_path.is_empty() {
+            let path = PathBuf::from(&custom_path);
+            if path.is_absolute() {
+                return path;
+            }
+            // 相对路径基于数据目录
+            return get_opencode_data_dir().join(path);
+        }
+    }
+
+    get_opencode_data_dir().join("opencode.db")
+}
+
+fn get_opencode_data_dir() -> PathBuf {
+    // 尊重 XDG_DATA_HOME（按 XDG 规范，空字符串视为未设置）
+    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
+        if !xdg_data.is_empty() {
+            return PathBuf::from(xdg_data).join("opencode");
+        }
+    }
+
+    // OpenCode 使用 xdg-basedir，不遵守 macOS/Windows 平台约定，
+    // 所有平台默认都落在 ~/.local/share/opencode
+    crate::config::get_home_dir()
+        .join(".local")
+        .join("share")
+        .join("opencode")
 }
 
 #[allow(dead_code)]
@@ -35,7 +95,12 @@ pub fn read_opencode_config() -> Result<Value, AppError> {
     }
 
     let content = std::fs::read_to_string(&path).map_err(|e| AppError::io(&path, e))?;
-    serde_json::from_str(&content).map_err(|e| AppError::json(&path, e))
+    json5::from_str(&content).map_err(|e| {
+        AppError::Config(format!(
+            "Failed to parse OpenCode config: {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 pub fn write_opencode_config(config: &Value) -> Result<(), AppError> {
@@ -140,58 +205,56 @@ pub fn remove_mcp_server(id: &str) -> Result<(), AppError> {
 
 pub fn add_plugin(plugin_name: &str) -> Result<(), AppError> {
     let mut config = read_opencode_config()?;
+    let normalized_plugin_name = canonicalize_plugin_name(plugin_name);
 
     let plugins = config.get_mut("plugin").and_then(|v| v.as_array_mut());
 
     match plugins {
         Some(arr) => {
             // Mutual exclusion: standard OMO and OMO Slim cannot coexist as plugins
-            if plugin_name.starts_with("oh-my-opencode")
-                && !plugin_name.starts_with("oh-my-opencode-slim")
-            {
-                // Adding standard OMO -> remove all Slim variants
-                arr.retain(|v| {
-                    v.as_str()
-                        .map(|s| !s.starts_with("oh-my-opencode-slim"))
-                        .unwrap_or(true)
-                });
-            } else if plugin_name.starts_with("oh-my-opencode-slim") {
-                // Adding Slim -> remove all standard OMO variants (but keep slim)
+            if matches_any_plugin_prefix(&normalized_plugin_name, &STANDARD_OMO_PLUGIN_PREFIXES) {
                 arr.retain(|v| {
                     v.as_str()
                         .map(|s| {
-                            !s.starts_with("oh-my-opencode") || s.starts_with("oh-my-opencode-slim")
+                            !matches_any_plugin_prefix(s, &STANDARD_OMO_PLUGIN_PREFIXES)
+                                && !matches_any_plugin_prefix(s, &SLIM_OMO_PLUGIN_PREFIXES)
+                        })
+                        .unwrap_or(true)
+                });
+            } else if matches_any_plugin_prefix(&normalized_plugin_name, &SLIM_OMO_PLUGIN_PREFIXES)
+            {
+                arr.retain(|v| {
+                    v.as_str()
+                        .map(|s| {
+                            !matches_any_plugin_prefix(s, &STANDARD_OMO_PLUGIN_PREFIXES)
+                                && !matches_any_plugin_prefix(s, &SLIM_OMO_PLUGIN_PREFIXES)
                         })
                         .unwrap_or(true)
                 });
             }
 
-            let already_exists = arr.iter().any(|v| v.as_str() == Some(plugin_name));
+            let already_exists = arr
+                .iter()
+                .any(|v| v.as_str() == Some(normalized_plugin_name.as_str()));
             if !already_exists {
-                arr.push(Value::String(plugin_name.to_string()));
+                arr.push(Value::String(normalized_plugin_name));
             }
         }
         None => {
-            config["plugin"] = json!([plugin_name]);
+            config["plugin"] = json!([normalized_plugin_name]);
         }
     }
 
     write_opencode_config(&config)
 }
 
-pub fn remove_plugin_by_prefix(prefix: &str) -> Result<(), AppError> {
+pub fn remove_plugins_by_prefixes(prefixes: &[&str]) -> Result<(), AppError> {
     let mut config = read_opencode_config()?;
 
     if let Some(arr) = config.get_mut("plugin").and_then(|v| v.as_array_mut()) {
         arr.retain(|v| {
             v.as_str()
-                .map(|s| {
-                    if !s.starts_with(prefix) {
-                        return true; // Keep: doesn't match prefix at all
-                    }
-                    let rest = &s[prefix.len()..];
-                    rest.starts_with('-')
-                })
+                .map(|s| !matches_any_plugin_prefix(s, prefixes))
                 .unwrap_or(true)
         });
 

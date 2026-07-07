@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::AppError;
 
@@ -46,25 +47,118 @@ pub fn get_default_claude_mcp_path() -> PathBuf {
     get_home_dir().join(".claude.json")
 }
 
-fn derive_mcp_path_from_override(dir: &Path) -> Option<PathBuf> {
-    let file_name = dir
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())?
-        .trim()
-        .to_string();
-    if file_name.is_empty() {
-        return None;
+fn normalize_path_lexically(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
+        }
     }
-    let parent = dir.parent().unwrap_or_else(|| Path::new(""));
-    Some(parent.join(format!("{file_name}.json")))
+
+    normalized
 }
 
-/// 获取 Claude MCP 配置文件路径，若设置了目录覆盖则与覆盖目录同级
+fn comparable_path_key(path: &Path) -> String {
+    let mut key = normalize_path_lexically(path).to_string_lossy().to_string();
+
+    #[cfg(windows)]
+    {
+        key = key.replace('\\', "/");
+    }
+
+    while key.len() > 1 && key.ends_with('/') {
+        key.pop();
+    }
+
+    #[cfg(windows)]
+    {
+        key.make_ascii_lowercase();
+    }
+
+    key
+}
+
+fn path_eq_lexical(left: &Path, right: &Path) -> bool {
+    comparable_path_key(left) == comparable_path_key(right)
+}
+
+#[cfg(windows)]
+fn derive_wsl_default_mcp_path(dir: &Path) -> Option<PathBuf> {
+    use std::path::Prefix;
+
+    let normalized = normalize_path_lexically(dir);
+    let mut components = normalized.components();
+    let prefix = match components.next()? {
+        Component::Prefix(prefix) => prefix,
+        _ => return None,
+    };
+
+    let server = match prefix.kind() {
+        Prefix::UNC(server, _) | Prefix::VerbatimUNC(server, _) => server.to_string_lossy(),
+        _ => return None,
+    };
+
+    if !server.eq_ignore_ascii_case("wsl$") && !server.eq_ignore_ascii_case("wsl.localhost") {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for component in components {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => parts.push(part.to_string_lossy().to_string()),
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+
+    let is_wsl_home_default =
+        parts.len() == 3 && parts[0] == "home" && !parts[1].is_empty() && parts[2] == ".claude";
+    let is_wsl_root_default = parts.len() == 2 && parts[0] == "root" && parts[1] == ".claude";
+
+    if is_wsl_home_default || is_wsl_root_default {
+        return normalized
+            .parent()
+            .map(|parent| parent.join(".claude.json"));
+    }
+
+    None
+}
+
+fn default_mcp_path_for_config_dir(dir: &Path) -> Option<PathBuf> {
+    let default_config_dir = get_home_dir().join(".claude");
+    if path_eq_lexical(dir, &default_config_dir) {
+        return Some(get_default_claude_mcp_path());
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(path) = derive_wsl_default_mcp_path(dir) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn derive_mcp_path_from_override(dir: &Path) -> PathBuf {
+    dir.join(".claude.json")
+}
+
+/// 获取 Claude MCP 配置文件路径
 pub fn get_claude_mcp_path() -> PathBuf {
     if let Some(custom_dir) = crate::settings::get_claude_override_dir() {
-        if let Some(path) = derive_mcp_path_from_override(&custom_dir) {
+        if let Some(path) = default_mcp_path_for_config_dir(&custom_dir) {
             return path;
         }
+        return derive_mcp_path_from_override(&custom_dir);
     }
     get_default_claude_mcp_path()
 }
@@ -159,15 +253,34 @@ pub fn read_json_file<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<T, AppE
     serde_json::from_str(&content).map_err(|e| AppError::json(path, e))
 }
 
-/// 写入 JSON 配置文件
+/// 递归排序 JSON 对象的键（按字母顺序），确保序列化输出是确定性的
+fn sort_json_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut sorted_map = Map::new();
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for key in keys {
+                sorted_map.insert(key.clone(), sort_json_keys(&map[key]));
+            }
+            Value::Object(sorted_map)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sort_json_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// 写入 JSON 配置文件（键按字母排序，确保确定性输出）
 pub fn write_json_file<T: Serialize>(path: &Path, data: &T) -> Result<(), AppError> {
     // 确保目录存在
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| AppError::io(parent, e))?;
     }
 
-    let json =
-        serde_json::to_string_pretty(data).map_err(|e| AppError::JsonSerialize { source: e })?;
+    let value = serde_json::to_value(data).map_err(|e| AppError::JsonSerialize { source: e })?;
+    let sorted_value = sort_json_keys(&value);
+    let json = serde_json::to_string_pretty(&sorted_value)
+        .map_err(|e| AppError::JsonSerialize { source: e })?;
 
     atomic_write(path, json.as_bytes())
 }
@@ -243,33 +356,170 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derive_mcp_path_from_override_preserves_folder_name() {
+    fn derive_mcp_path_from_override_uses_config_dir_for_custom_path() {
         let override_dir = PathBuf::from("/tmp/profile/.claude");
-        let derived = derive_mcp_path_from_override(&override_dir)
-            .expect("should derive path for nested dir");
-        assert_eq!(derived, PathBuf::from("/tmp/profile/.claude.json"));
+        let derived = derive_mcp_path_from_override(&override_dir);
+        assert_eq!(derived, PathBuf::from("/tmp/profile/.claude/.claude.json"));
     }
 
     #[test]
-    fn derive_mcp_path_from_override_handles_non_hidden_folder() {
+    fn derive_mcp_path_from_override_uses_config_dir_for_non_hidden_folder() {
         let override_dir = PathBuf::from("/data/claude-config");
-        let derived = derive_mcp_path_from_override(&override_dir)
-            .expect("should derive path for standard dir");
-        assert_eq!(derived, PathBuf::from("/data/claude-config.json"));
+        let derived = derive_mcp_path_from_override(&override_dir);
+        assert_eq!(derived, PathBuf::from("/data/claude-config/.claude.json"));
     }
 
     #[test]
     fn derive_mcp_path_from_override_supports_relative_rootless_dir() {
         let override_dir = PathBuf::from("claude");
-        let derived = derive_mcp_path_from_override(&override_dir)
-            .expect("should derive path for single segment");
-        assert_eq!(derived, PathBuf::from("claude.json"));
+        let derived = derive_mcp_path_from_override(&override_dir);
+        assert_eq!(derived, PathBuf::from("claude/.claude.json"));
     }
 
     #[test]
-    fn derive_mcp_path_from_root_like_dir_returns_none() {
+    fn derive_mcp_path_from_root_like_dir_uses_root_file() {
         let override_dir = PathBuf::from("/");
-        assert!(derive_mcp_path_from_override(&override_dir).is_none());
+        let derived = derive_mcp_path_from_override(&override_dir);
+        assert_eq!(derived, PathBuf::from("/.claude.json"));
+    }
+
+    #[test]
+    fn derive_mcp_path_from_override_preserves_leading_parent_dirs() {
+        let override_dir = PathBuf::from("../../profiles/work/.claude");
+        let derived = derive_mcp_path_from_override(&override_dir);
+        assert_eq!(derived, override_dir.join(".claude.json"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_unc_home_default_uses_split_mcp_path() {
+        let override_dir = PathBuf::from(r"\\wsl$\Ubuntu\home\travis\.claude");
+        let derived = default_mcp_path_for_config_dir(&override_dir)
+            .expect("WSL home default should use split MCP path");
+        assert_eq!(
+            derived,
+            PathBuf::from(r"\\wsl$\Ubuntu\home\travis\.claude.json")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_unc_root_default_uses_split_mcp_path() {
+        let override_dir = PathBuf::from(r"\\wsl.localhost\Ubuntu\root\.claude");
+        let derived = default_mcp_path_for_config_dir(&override_dir)
+            .expect("WSL root default should use split MCP path");
+        assert_eq!(
+            derived,
+            PathBuf::from(r"\\wsl.localhost\Ubuntu\root\.claude.json")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_unc_custom_dir_uses_nested_mcp_path() {
+        let override_dir = PathBuf::from(r"\\wsl$\Ubuntu\opt\claude\.claude");
+        assert!(default_mcp_path_for_config_dir(&override_dir).is_none());
+        assert_eq!(
+            derive_mcp_path_from_override(&override_dir),
+            PathBuf::from(r"\\wsl$\Ubuntu\opt\claude\.claude\.claude.json")
+        );
+    }
+
+    #[test]
+    fn sort_json_keys_sorts_top_level_object() {
+        let input = serde_json::json!({
+            "z": 1,
+            "a": 2,
+            "m": 3,
+        });
+        let sorted = sort_json_keys(&input);
+        let serialized = serde_json::to_string(&sorted).unwrap();
+        assert_eq!(serialized, r#"{"a":2,"m":3,"z":1}"#);
+    }
+
+    #[test]
+    fn sort_json_keys_recurses_into_nested_objects() {
+        let input = serde_json::json!({
+            "outer_b": {"z": 1, "a": 2},
+            "outer_a": {"y": 3, "b": 4},
+        });
+        let sorted = sort_json_keys(&input);
+        let serialized = serde_json::to_string(&sorted).unwrap();
+        assert_eq!(
+            serialized,
+            r#"{"outer_a":{"b":4,"y":3},"outer_b":{"a":2,"z":1}}"#
+        );
+    }
+
+    #[test]
+    fn sort_json_keys_preserves_array_order() {
+        let input = serde_json::json!([3, 1, 2]);
+        let sorted = sort_json_keys(&input);
+        let serialized = serde_json::to_string(&sorted).unwrap();
+        assert_eq!(serialized, "[3,1,2]");
+    }
+
+    #[test]
+    fn sort_json_keys_sorts_objects_inside_arrays_but_keeps_array_order() {
+        let input = serde_json::json!([
+            {"z": 1, "a": 2},
+            {"y": 3, "b": 4},
+        ]);
+        let sorted = sort_json_keys(&input);
+        let serialized = serde_json::to_string(&sorted).unwrap();
+        assert_eq!(serialized, r#"[{"a":2,"z":1},{"b":4,"y":3}]"#);
+    }
+
+    #[test]
+    fn sort_json_keys_passes_through_primitives() {
+        let cases = vec![
+            serde_json::json!("hello"),
+            serde_json::json!(42),
+            serde_json::json!(3.5),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ];
+        for value in cases {
+            let sorted = sort_json_keys(&value);
+            assert_eq!(sorted, value);
+        }
+    }
+
+    #[test]
+    fn sort_json_keys_handles_empty_collections() {
+        let empty_obj = serde_json::json!({});
+        assert_eq!(
+            serde_json::to_string(&sort_json_keys(&empty_obj)).unwrap(),
+            "{}"
+        );
+
+        let empty_arr = serde_json::json!([]);
+        assert_eq!(
+            serde_json::to_string(&sort_json_keys(&empty_arr)).unwrap(),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn sort_json_keys_produces_identical_output_for_different_insertion_orders() {
+        // 核心保证：同一逻辑配置无论键的插入顺序如何，写出的字节序列必须一致。
+        let mut a = Map::new();
+        a.insert("env".to_string(), serde_json::json!({"PATH": "/usr/bin"}));
+        a.insert("model".to_string(), serde_json::json!("claude-sonnet-4-5"));
+        a.insert("permissions".to_string(), serde_json::json!({"allow": []}));
+
+        let mut b = Map::new();
+        b.insert("permissions".to_string(), serde_json::json!({"allow": []}));
+        b.insert("model".to_string(), serde_json::json!("claude-sonnet-4-5"));
+        b.insert("env".to_string(), serde_json::json!({"PATH": "/usr/bin"}));
+
+        let sorted_a = sort_json_keys(&Value::Object(a));
+        let sorted_b = sort_json_keys(&Value::Object(b));
+
+        assert_eq!(
+            serde_json::to_string(&sorted_a).unwrap(),
+            serde_json::to_string(&sorted_b).unwrap(),
+        );
     }
 }
 
