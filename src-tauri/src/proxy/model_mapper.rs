@@ -166,7 +166,7 @@ impl ModelMapping {
     }
 
     /// 根据原始模型名称获取映射后的模型（传统方式）
-    pub fn map_model(&self, original_model: &str, has_thinking: bool) -> String {
+    pub fn map_model(&self, original_model: &str, _has_thinking: bool) -> String {
         let model_lower = original_model.to_lowercase();
 
         // 1. 按模型类型匹配
