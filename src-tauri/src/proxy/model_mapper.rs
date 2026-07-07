@@ -14,6 +14,7 @@ pub struct ModelMapping {
     pub opus_model: Option<String>,
     pub fable_model: Option<String>,
     pub default_model: Option<String>,
+    pub reasoning_model: Option<String>,
 }
 
 impl ModelMapping {
@@ -123,6 +124,11 @@ impl ModelMapping {
                 .map(String::from),
             default_model: env
                 .and_then(|e| e.get("ANTHROPIC_MODEL"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            reasoning_model: env
+                .and_then(|e| e.get("ANTHROPIC_REASONING_MODEL"))
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from),
@@ -994,10 +1000,10 @@ mod tests {
                 limit_daily_usd: None,
                 limit_monthly_usd: None,
                 test_config: None,
-                proxy_config: None,
                 api_format: Some("anthropic".to_string()),
                 api_key_field: None,
                 prompt_cache_key: None,
+                ..Default::default()
             }),
             icon: Some("zhipu".to_string()),
             icon_color: Some("#0F62FE".to_string()),
@@ -1514,7 +1520,9 @@ mod tests {
         assert!(!mapping.has_model("glm-5-turbo"));
         // baidu-mix 支持 glm-5
         assert!(mapping.has_model("glm-5"));
+    }
 
+    #[test]
     fn strips_one_m_suffix_before_upstream() {
         let body = json!({"model": "deepseek-v4-pro[1M]"});
         let result = strip_one_m_suffix_for_upstream_from_body(body);

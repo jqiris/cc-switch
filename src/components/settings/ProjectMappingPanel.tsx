@@ -487,7 +487,7 @@ export function ProjectMappingPanel({
                 <Slider
                   id="priority"
                   value={[formData.priority]}
-                  onValueChange={([value]) =>
+                  onValueChange={([value]: number[]) =>
                     setFormData({ ...formData, priority: value })
                   }
                   min={1}

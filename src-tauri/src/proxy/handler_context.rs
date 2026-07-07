@@ -265,7 +265,6 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
-            self.is_project_mapped_provider,
         )
     }
 

@@ -464,11 +464,16 @@ Self::set_user_version(conn, 7)?;
                          Self::migrate_v9_to_v10(conn)?;
                          Self::set_user_version(conn, 10)?;
                      }
-                     10 => {
-                         log::info!("迁移数据库从 v10 到 v11（usage_daily_rollups 保留 request_model 维度）");
-                         Self::migrate_v10_to_v11(conn)?;
-                         Self::set_user_version(conn, 11)?;
-                     }
+                      10 => {
+                          log::info!("迁移数据库从 v10 到 v11（usage_daily_rollups 保留 request_model 维度）");
+                          Self::migrate_v10_to_v11(conn)?;
+                          Self::set_user_version(conn, 11)?;
+                      }
+                      11 => {
+                          log::info!("迁移数据库从 v11 到 v12（添加项目目录映射表）");
+                          Self::migrate_v11_to_v12(conn)?;
+                          Self::set_user_version(conn, 12)?;
+                      }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1295,8 +1300,8 @@ Self::set_user_version(conn, 7)?;
         Ok(())
     }
 
-    /// v6 -> v7 迁移：添加项目目录映射表
-    fn migrate_v6_to_v7(conn: &Connection) -> Result<(), AppError> {
+    /// v11 -> v12 迁移：添加项目目录映射表
+    fn migrate_v11_to_v12(conn: &Connection) -> Result<(), AppError> {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS project_provider_mappings (
                 id TEXT PRIMARY KEY,
